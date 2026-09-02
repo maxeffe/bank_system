@@ -1,0 +1,352 @@
+from decimal import Decimal
+
+import pytest
+
+from src.enums import AccountStatus, Currency
+from src.exceptions import (
+    AccountClosedError,
+    AccountFrozenError,
+    InsufficientFundsError,
+    InvalidOperationError,
+)
+from src.models.accounts import (
+    BankAccount,
+    InvestmentAccount,
+    PremiumAccount,
+    SavingsAccount,
+)
+
+
+def make_bank_account(**kwargs):
+    kwargs.setdefault("user_id", 1)
+    kwargs.setdefault("owner_name", "Max Petrov")
+    kwargs.setdefault("balance", Decimal("1000"))
+    return BankAccount(**kwargs)
+
+
+class TestMoneyValidation:
+    @pytest.mark.parametrize("value", [100, 0, Decimal("100.50"), Decimal("0")])
+    def test_accepts_int_and_decimal(self, value):
+        assert BankAccount._is_valid_money(value) is True
+
+    @pytest.mark.parametrize(
+        "value",
+        [0.1, 100.0, True, False, "100", None, [], Decimal("NaN"), Decimal("Infinity")],
+    )
+    def test_rejects_everything_else(self, value):
+        assert BankAccount._is_valid_money(value) is False
+
+    def test_kopecks_are_not_lost(self):
+        account = make_bank_account(balance=Decimal("0"))
+
+        for _ in range(10):
+            account.deposit(Decimal("0.10"))
+
+        assert account.balance == Decimal("1.00")
+
+    def test_amount_is_quantized_to_two_places(self):
+        account = make_bank_account(balance=Decimal("0"))
+
+        account.deposit(Decimal("10.005"))
+
+        assert account.balance == Decimal("10.01")
+
+    def test_float_is_rejected(self):
+        account = make_bank_account()
+
+        with pytest.raises(InvalidOperationError):
+            account.deposit(0.1)
+
+
+class TestBankAccountCreation:
+    def test_creates_with_valid_data(self):
+        account = make_bank_account(balance=Decimal("500"))
+
+        assert account.balance == Decimal("500.00")
+        assert account.status is AccountStatus.ACTIVE
+        assert account.currency is Currency.RUB
+        assert len(account.account_id) > 0
+
+    @pytest.mark.parametrize(
+        "field, value",
+        [
+            ("user_id", None),
+            ("owner_name", ""),
+            ("owner_name", "   "),
+            ("owner_name", 123),
+            ("balance", Decimal("-1")),
+            ("balance", 0.5),
+            ("status", "active"),
+            ("currency", "rub"),
+        ],
+    )
+    def test_rejects_invalid_field(self, field, value):
+        with pytest.raises(InvalidOperationError):
+            make_bank_account(**{field: value})
+
+    def test_owner_name_setter_validates(self):
+        account = make_bank_account()
+
+        account.owner_name = "Anna Ivanova"
+        assert account.owner_name == "Anna Ivanova"
+
+        with pytest.raises(InvalidOperationError):
+            account.owner_name = "  "
+
+    def test_balance_has_no_setter(self):
+        account = make_bank_account()
+
+        with pytest.raises(AttributeError):
+            account.balance = Decimal("999999")
+
+
+class TestBankAccountOperations:
+    def test_deposit_increases_balance(self):
+        account = make_bank_account(balance=Decimal("100"))
+
+        account.deposit(Decimal("50"))
+
+        assert account.balance == Decimal("150.00")
+
+    def test_withdraw_decreases_balance(self):
+        account = make_bank_account(balance=Decimal("100"))
+
+        account.withdraw(Decimal("30"))
+
+        assert account.balance == Decimal("70.00")
+
+    def test_withdraw_more_than_balance_fails(self):
+        account = make_bank_account(balance=Decimal("100"))
+
+        with pytest.raises(InsufficientFundsError):
+            account.withdraw(Decimal("101"))
+
+        assert account.balance == Decimal("100.00")
+
+    @pytest.mark.parametrize("amount", [Decimal("0"), Decimal("-10")])
+    def test_non_positive_amount_fails(self, amount):
+        account = make_bank_account()
+
+        with pytest.raises(InvalidOperationError):
+            account.deposit(amount)
+
+
+class TestAccountStatusGuard:
+    def test_frozen_blocks_deposit_and_withdraw(self):
+        account = make_bank_account()
+        account.status = AccountStatus.FROZEN
+
+        with pytest.raises(AccountFrozenError):
+            account.deposit(Decimal("10"))
+
+        with pytest.raises(AccountFrozenError):
+            account.withdraw(Decimal("10"))
+
+    def test_closed_blocks_deposit_and_withdraw(self):
+        account = make_bank_account()
+        account.status = AccountStatus.CLOSED
+
+        with pytest.raises(AccountClosedError):
+            account.deposit(Decimal("10"))
+
+        with pytest.raises(AccountClosedError):
+            account.withdraw(Decimal("10"))
+
+    def test_status_setter_rejects_non_enum(self):
+        account = make_bank_account()
+
+        with pytest.raises(InvalidOperationError):
+            account.status = "frozen"
+
+
+class TestSavingsAccount:
+    def test_min_balance_blocks_withdrawal(self):
+        account = SavingsAccount(
+            user_id=1,
+            owner_name="Max",
+            balance=Decimal("5000"),
+            min_balance=Decimal("1000"),
+        )
+
+        with pytest.raises(InsufficientFundsError):
+            account.withdraw(Decimal("4500"))
+
+        assert account.balance == Decimal("5000.00")
+
+    def test_withdrawal_down_to_min_balance_is_allowed(self):
+        account = SavingsAccount(
+            user_id=1,
+            owner_name="Max",
+            balance=Decimal("5000"),
+            min_balance=Decimal("1000"),
+        )
+
+        account.withdraw(Decimal("4000"))
+
+        assert account.balance == Decimal("1000.00")
+
+    @pytest.mark.parametrize(
+        "status, error",
+        [
+            (AccountStatus.FROZEN, AccountFrozenError),
+            (AccountStatus.CLOSED, AccountClosedError),
+        ],
+    )
+    def test_status_is_checked_before_min_balance(self, status, error):
+        account = SavingsAccount(
+            user_id=1,
+            owner_name="Max",
+            balance=Decimal("5000"),
+            min_balance=Decimal("1000"),
+        )
+        account.status = status
+
+        with pytest.raises(error):
+            account.withdraw(Decimal("4500"))
+
+    def test_interest_is_rounded_to_kopecks(self):
+        account = SavingsAccount(
+            user_id=1,
+            owner_name="Max",
+            balance=Decimal("333.33"),
+            monthly_interest_rate=Decimal("0.037"),
+        )
+
+        interest = account.apply_monthly_interest()
+
+        assert interest == Decimal("12.33")
+        assert account.balance == Decimal("345.66")
+
+    def test_interest_blocked_on_frozen_account(self):
+        account = SavingsAccount(user_id=1, owner_name="Max", balance=Decimal("100"))
+        account.status = AccountStatus.FROZEN
+
+        with pytest.raises(AccountFrozenError):
+            account.apply_monthly_interest()
+
+    def test_balance_below_min_balance_rejected(self):
+        with pytest.raises(InvalidOperationError):
+            SavingsAccount(
+                user_id=1,
+                owner_name="Max",
+                balance=Decimal("100"),
+                min_balance=Decimal("500"),
+            )
+
+
+class TestPremiumAccount:
+    def test_fee_is_added_to_withdrawal(self):
+        account = PremiumAccount(
+            user_id=1,
+            owner_name="Anna",
+            balance=Decimal("1000"),
+            fixed_fee=Decimal("25"),
+        )
+
+        account.withdraw(Decimal("100"))
+
+        assert account.balance == Decimal("875.00")
+
+    def test_overdraft_allows_negative_balance(self):
+        account = PremiumAccount(
+            user_id=1,
+            owner_name="Anna",
+            balance=Decimal("100"),
+            overdraft_limit=Decimal("500"),
+        )
+
+        account.withdraw(Decimal("400"))
+
+        assert account.balance == Decimal("-300.00")
+
+    def test_overdraft_limit_is_enforced(self):
+        account = PremiumAccount(
+            user_id=1,
+            owner_name="Anna",
+            balance=Decimal("100"),
+            overdraft_limit=Decimal("500"),
+        )
+
+        with pytest.raises(InsufficientFundsError):
+            account.withdraw(Decimal("601"))
+
+    def test_withdraw_limit_is_enforced(self):
+        account = PremiumAccount(
+            user_id=1,
+            owner_name="Anna",
+            balance=Decimal("100000"),
+            withdraw_limit=Decimal("3000"),
+        )
+
+        with pytest.raises(InvalidOperationError):
+            account.withdraw(Decimal("3001"))
+
+    def test_frozen_premium_raises_status_error(self):
+        account = PremiumAccount(user_id=1, owner_name="Anna", balance=Decimal("100"))
+        account.status = AccountStatus.FROZEN
+
+        with pytest.raises(AccountFrozenError):
+            account.withdraw(Decimal("10"))
+
+
+class TestInvestmentAccount:
+    def test_missing_assets_default_to_zero(self):
+        account = InvestmentAccount(
+            user_id=1, owner_name="Olga", portfolio={"stocks": Decimal("1000")}
+        )
+
+        assert account.project_yearly_growth() == Decimal("120.00")
+
+    def test_unknown_asset_rejected(self):
+        with pytest.raises(InvalidOperationError):
+            InvestmentAccount(
+                user_id=1, owner_name="Olga", portfolio={"crypto": Decimal("100")}
+            )
+
+    def test_negative_asset_rejected(self):
+        with pytest.raises(InvalidOperationError):
+            InvestmentAccount(
+                user_id=1, owner_name="Olga", portfolio={"stocks": Decimal("-1")}
+            )
+
+    def test_projected_growth(self):
+        account = InvestmentAccount(
+            user_id=1,
+            owner_name="Olga",
+            portfolio={
+                "stocks": Decimal("1000"),
+                "bonds": Decimal("500"),
+                "etf": Decimal("800"),
+            },
+        )
+
+        assert account.project_yearly_growth() == Decimal("209.00")
+
+
+class TestPolymorphism:
+    def test_each_type_reports_its_own_info(self):
+        accounts = [
+            BankAccount(user_id=1, owner_name="A", balance=Decimal("100")),
+            SavingsAccount(user_id=2, owner_name="B", balance=Decimal("100")),
+            PremiumAccount(user_id=3, owner_name="C", balance=Decimal("100")),
+            InvestmentAccount(user_id=4, owner_name="D", balance=Decimal("100")),
+        ]
+
+        markers = [account.get_account_info() for account in accounts]
+
+        assert "account_type: BANK" in markers[0]
+        assert "account_type: SAVINGS" in markers[1]
+        assert "account_type: PREMIUM" in markers[2]
+        assert "account_type: INVESTMENT" in markers[3]
+
+    def test_withdraw_behaves_differently_per_type(self):
+        plain = BankAccount(user_id=1, owner_name="A", balance=Decimal("1000"))
+        premium = PremiumAccount(
+            user_id=2, owner_name="C", balance=Decimal("1000"), fixed_fee=Decimal("25")
+        )
+
+        plain.withdraw(Decimal("100"))
+        premium.withdraw(Decimal("100"))
+
+        assert plain.balance == Decimal("900.00")
+        assert premium.balance == Decimal("875.00")
