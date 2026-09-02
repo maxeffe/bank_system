@@ -2,9 +2,11 @@ from datetime import datetime
 from decimal import Decimal
 
 import pytest
+from loguru import logger
 
 import src.models.client as client_module
-from src.models import Bank, Client
+from src.enums import Currency
+from src.models import Bank, Client, TransactionProcessor, TransactionQueue
 
 REAL_PASSWORD_ITERATIONS = client_module.PASSWORD_ITERATIONS
 TEST_PASSWORD_ITERATIONS = 1_000
@@ -49,3 +51,48 @@ def bank_with_client(bank, make_client):
 @pytest.fixture
 def account(bank_with_client):
     return bank_with_client.open_account(1, "bank", balance=Decimal("1000"))
+
+
+@pytest.fixture
+def transfer_bank(bank, make_client):
+    bank.add_client(make_client(client_id=1, full_name="Max Petrov"))
+    bank.add_client(make_client(client_id=2, full_name="Anna Ivanova"))
+    bank.open_account(1, "bank", balance=Decimal("10000"))
+    bank.open_account(2, "bank", balance=Decimal("1000"))
+    return bank
+
+
+@pytest.fixture
+def source_account(transfer_bank):
+    return transfer_bank.search_accounts(client_id=1)[0]
+
+
+@pytest.fixture
+def target_account(transfer_bank):
+    return transfer_bank.search_accounts(client_id=2)[0]
+
+
+@pytest.fixture
+def usd_account(transfer_bank):
+    return transfer_bank.open_account(
+        2, "bank", balance=Decimal("100"), currency=Currency.USD
+    )
+
+
+@pytest.fixture
+def queue():
+    return TransactionQueue()
+
+
+@pytest.fixture
+def processor(transfer_bank):
+    return TransactionProcessor(transfer_bank)
+
+
+@pytest.fixture
+def log_events():
+    """Собирает структурные события, которые пишут модели."""
+    events = []
+    handler_id = logger.add(lambda message: events.append(message.record), level="INFO")
+    yield events
+    logger.remove(handler_id)

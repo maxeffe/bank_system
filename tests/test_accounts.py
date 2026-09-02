@@ -24,18 +24,7 @@ def make_bank_account(**kwargs):
     return BankAccount(**kwargs)
 
 
-class TestMoneyValidation:
-    @pytest.mark.parametrize("value", [100, 0, Decimal("100.50"), Decimal("0")])
-    def test_accepts_int_and_decimal(self, value):
-        assert BankAccount._is_valid_money(value) is True
-
-    @pytest.mark.parametrize(
-        "value",
-        [0.1, 100.0, True, False, "100", None, [], Decimal("NaN"), Decimal("Infinity")],
-    )
-    def test_rejects_everything_else(self, value):
-        assert BankAccount._is_valid_money(value) is False
-
+class TestMoneyOnAccounts:
     def test_kopecks_are_not_lost(self):
         account = make_bank_account(balance=Decimal("0"))
 
@@ -152,11 +141,68 @@ class TestAccountStatusGuard:
         with pytest.raises(AccountClosedError):
             account.withdraw(Decimal("10"))
 
+    @pytest.mark.parametrize("new_status", [AccountStatus.ACTIVE, AccountStatus.FROZEN])
+    def test_closed_is_terminal(self, new_status):
+        account = make_bank_account()
+        account.status = AccountStatus.CLOSED
+
+        with pytest.raises(InvalidOperationError):
+            account.status = new_status
+
+        assert account.status is AccountStatus.CLOSED
+
+    def test_closing_twice_is_allowed(self):
+        account = make_bank_account()
+        account.status = AccountStatus.CLOSED
+
+        account.status = AccountStatus.CLOSED
+
+        assert account.status is AccountStatus.CLOSED
+
     def test_status_setter_rejects_non_enum(self):
         account = make_bank_account()
 
         with pytest.raises(InvalidOperationError):
             account.status = "frozen"
+
+
+class TestWithdrawalRules:
+    """Правила снятия спрашиваются у счёта, а не угадываются по типу."""
+
+    def test_plain_account_has_no_fee_and_no_overdraft(self):
+        account = make_bank_account()
+
+        assert account.withdrawal_fee(Decimal("100")) == Decimal("0.00")
+        assert account.min_allowed_balance == Decimal("0.00")
+
+    def test_savings_reports_its_minimum(self):
+        account = SavingsAccount(
+            user_id=1,
+            owner_name="Max",
+            balance=Decimal("5000"),
+            min_balance=Decimal("1000"),
+        )
+
+        assert account.withdrawal_fee(Decimal("100")) == Decimal("0.00")
+        assert account.min_allowed_balance == Decimal("1000.00")
+
+    def test_premium_reports_fee_and_overdraft(self):
+        account = PremiumAccount(
+            user_id=1,
+            owner_name="Anna",
+            balance=Decimal("1000"),
+            fixed_fee=Decimal("25"),
+            overdraft_limit=Decimal("500"),
+        )
+
+        assert account.withdrawal_fee(Decimal("100")) == Decimal("25.00")
+        assert account.min_allowed_balance == Decimal("-500.00")
+
+    def test_investment_uses_base_rules(self):
+        account = InvestmentAccount(user_id=1, owner_name="Olga")
+
+        assert account.withdrawal_fee(Decimal("100")) == Decimal("0.00")
+        assert account.min_allowed_balance == Decimal("0.00")
 
 
 class TestSavingsAccount:
@@ -324,6 +370,27 @@ class TestInvestmentAccount:
 
 
 class TestPolymorphism:
+    @pytest.mark.parametrize(
+        "account_class",
+        [BankAccount, SavingsAccount, PremiumAccount, InvestmentAccount],
+    )
+    @pytest.mark.parametrize("method", ["withdraw", "get_account_info", "__str__"])
+    def test_every_type_defines_its_own_method(self, account_class, method):
+        """День 2: каждый тип счёта переопределяет эти три метода."""
+        assert method in account_class.__dict__
+
+    def test_investment_withdraw_follows_base_rules(self):
+        account = InvestmentAccount(
+            user_id=1, owner_name="Olga", balance=Decimal("1000")
+        )
+
+        account.withdraw(Decimal("400"))
+
+        assert account.balance == Decimal("600.00")
+
+        with pytest.raises(InsufficientFundsError):
+            account.withdraw(Decimal("601"))
+
     def test_each_type_reports_its_own_info(self):
         accounts = [
             BankAccount(user_id=1, owner_name="A", balance=Decimal("100")),

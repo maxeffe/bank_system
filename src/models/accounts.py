@@ -1,16 +1,22 @@
-from abc import ABC, abstractmethod
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import uuid
+from abc import ABC, abstractmethod
+from decimal import ROUND_HALF_UP, Decimal
+
+from loguru import logger
 
 from src.enums import AccountStatus, Currency
+from src.money import (
+    MONEY_PRECISION,
+    to_non_negative_money,
+    to_non_negative_rate,
+    to_positive_money,
+)
 from src.exceptions import (
     AccountClosedError,
     AccountFrozenError,
     InsufficientFundsError,
     InvalidOperationError,
 )
-
-MONEY_PRECISION = Decimal("0.01")
 
 
 class AbstractAccount(ABC):
@@ -60,10 +66,7 @@ class BankAccount(AbstractAccount):
         if user_id is None:
             raise InvalidOperationError("User id is required")
 
-        balance = self._to_money(balance, "Balance cannot be negative")
-
-        if balance < 0:
-            raise InvalidOperationError("Balance cannot be negative")
+        balance = to_non_negative_money(balance, "Balance cannot be negative")
 
         if not isinstance(status, AccountStatus):
             raise InvalidOperationError("Invalid account status")
@@ -72,36 +75,6 @@ class BankAccount(AbstractAccount):
             raise InvalidOperationError("Invalid currency")
 
         super().__init__(account_id, user_id, owner_name, balance, status, currency)
-
-    @staticmethod
-    def _is_valid_money(value):
-        if isinstance(value, bool):
-            return False
-
-        if isinstance(value, int):
-            return True
-
-        if isinstance(value, Decimal):
-            return value.is_finite()
-
-        return False
-
-    @classmethod
-    def _to_money(cls, value, error_message):
-        if not cls._is_valid_money(value):
-            raise InvalidOperationError(error_message)
-
-        try:
-            return Decimal(value).quantize(MONEY_PRECISION, rounding=ROUND_HALF_UP)
-        except InvalidOperation:
-            raise InvalidOperationError(error_message) from None
-
-    @classmethod
-    def _to_rate(cls, value, error_message):
-        if not cls._is_valid_money(value):
-            raise InvalidOperationError(error_message)
-
-        return Decimal(value)
 
     @property
     def account_id(self):
@@ -138,17 +111,27 @@ class BankAccount(AbstractAccount):
         if not isinstance(new_status, AccountStatus):
             raise InvalidOperationError("Invalid account status")
 
+        if (
+            self._status is AccountStatus.CLOSED
+            and new_status is not AccountStatus.CLOSED
+        ):
+            raise InvalidOperationError("Closed account cannot change status")
+
         self._status = new_status
 
     def _validate_amount(self, amount):
-        amount = self._to_money(amount, "Amount must be a positive number")
+        return to_positive_money(amount, "Amount must be a positive number")
 
-        if amount <= 0:
-            raise InvalidOperationError("Amount must be a positive number")
+    def withdrawal_fee(self, amount) -> Decimal:
+        """Своя комиссия счёта за снятие. Базовый счёт не берёт ничего."""
+        return Decimal("0.00")
 
-        return amount
+    @property
+    def min_allowed_balance(self) -> Decimal:
+        """Ниже какого баланса счёт опускаться не имеет права."""
+        return Decimal("0.00")
 
-    def _ensure_operational(self, action):
+    def ensure_operational(self, action):
         if self._status is AccountStatus.ACTIVE:
             return
 
@@ -160,31 +143,49 @@ class BankAccount(AbstractAccount):
 
         raise InvalidOperationError(f"Account status does not allow to {action}")
 
+    def _format_info(self, account_type: str, **extra) -> str:
+        """Общая часть карточки счёта плюс поля конкретного типа."""
+        lines = [
+            f"account_type: {account_type}",
+            f"owner_name: {self._owner_name}",
+            f"account_id: {self._account_id[-4:]}",
+            f"user_id: {self._user_id}",
+            f"balance: {self._balance} {self._currency}",
+            f"status: {self._status}",
+        ]
+        lines.extend(f"{name}: {value}" for name, value in extra.items())
+        return "\n".join(lines)
+
     def __str__(self):
-        return f"""
-            account_type: BANK\n
-            owner_name: {self._owner_name}\n
-            account_id: {self._account_id[-4::]}\n  
-            user_id: {self._user_id}\n
-            balance: {self._balance} {self._currency}\n
-            status: {self._status}\n
-            """
+        return self._format_info("BANK")
 
     def deposit(self, amount):
-        self._ensure_operational("accept deposits")
+        self.ensure_operational("accept deposits")
         amount = self._validate_amount(amount)
         self._balance += amount
-        print(f"Account topped up {amount}!")
+        logger.info(
+            "deposit",
+            account_id=self._account_id,
+            amount=amount,
+            currency=self._currency,
+            balance=self._balance,
+        )
 
     def withdraw(self, amount):
-        self._ensure_operational("withdraw money")
+        self.ensure_operational("withdraw money")
         amount = self._validate_amount(amount)
 
-        if self._balance < amount:
+        if self._balance - amount < self.min_allowed_balance:
             raise InsufficientFundsError("Not enough money to withdraw")
 
         self._balance -= amount
-        print(f"Charged {amount}!")
+        logger.info(
+            "withdrawal",
+            account_id=self._account_id,
+            amount=amount,
+            currency=self._currency,
+            balance=self._balance,
+        )
 
     def get_account_info(self):
         return str(self)
@@ -204,17 +205,12 @@ class SavingsAccount(BankAccount):
     ):
         super().__init__(account_id, user_id, owner_name, balance, status, currency)
 
-        min_balance = self._to_money(min_balance, "Min balance cannot be negative")
-
-        if min_balance < 0:
-            raise InvalidOperationError("Min balance cannot be negative")
-
-        monthly_interest_rate = self._to_rate(
+        min_balance = to_non_negative_money(
+            min_balance, "Min balance cannot be negative"
+        )
+        monthly_interest_rate = to_non_negative_rate(
             monthly_interest_rate, "Monthly interest rate cannot be negative"
         )
-
-        if monthly_interest_rate < 0:
-            raise InvalidOperationError("Monthly interest rate cannot be negative")
 
         if self._balance < min_balance:
             raise InvalidOperationError("Balance cannot be less than min balance")
@@ -223,33 +219,35 @@ class SavingsAccount(BankAccount):
         self._monthly_interest_rate = monthly_interest_rate
 
     def withdraw(self, amount):
-        self._ensure_operational("withdraw money")
+        self.ensure_operational("withdraw money")
         amount = self._validate_amount(amount)
 
-        if self._balance - amount < self._min_balance:
+        if self._balance - amount < self.min_allowed_balance:
             raise InsufficientFundsError("Withdrawal would break minimum balance")
 
         super().withdraw(amount)
 
+    @property
+    def min_allowed_balance(self) -> Decimal:
+        return self._min_balance
+
     def apply_monthly_interest(self):
-        self._ensure_operational("receive interest")
+        self.ensure_operational("receive interest")
         interest = (self._balance * self._monthly_interest_rate).quantize(
             MONEY_PRECISION, rounding=ROUND_HALF_UP
         )
         self._balance += interest
         return interest
 
+    def get_account_info(self):
+        return str(self)
+
     def __str__(self):
-        return f"""
-            account_type: SAVINGS\n
-            owner_name: {self._owner_name}\n
-            account_id: {self._account_id[-4::]}\n
-            user_id: {self._user_id}\n
-            balance: {self._balance} {self._currency}\n
-            status: {self._status}\n
-            min_balance: {self._min_balance}\n
-            monthly_interest_rate: {self._monthly_interest_rate}\n
-            """
+        return self._format_info(
+            "SAVINGS",
+            min_balance=self._min_balance,
+            monthly_interest_rate=self._monthly_interest_rate,
+        )
 
 
 class PremiumAccount(BankAccount):
@@ -267,56 +265,57 @@ class PremiumAccount(BankAccount):
     ):
         super().__init__(account_id, user_id, owner_name, balance, status, currency)
 
-        overdraft_limit = self._to_money(
+        overdraft_limit = to_non_negative_money(
             overdraft_limit, "Overdraft limit cannot be negative"
         )
-
-        if overdraft_limit < 0:
-            raise InvalidOperationError("Overdraft limit cannot be negative")
-
-        withdraw_limit = self._to_money(
+        withdraw_limit = to_positive_money(
             withdraw_limit, "Withdraw limit must be positive"
         )
-
-        if withdraw_limit <= 0:
-            raise InvalidOperationError("Withdraw limit must be positive")
-
-        fixed_fee = self._to_money(fixed_fee, "Fixed fee cannot be negative")
-
-        if fixed_fee < 0:
-            raise InvalidOperationError("Fixed fee cannot be negative")
+        fixed_fee = to_non_negative_money(fixed_fee, "Fixed fee cannot be negative")
 
         self._overdraft_limit = overdraft_limit
         self._withdraw_limit = withdraw_limit
         self._fixed_fee = fixed_fee
 
     def withdraw(self, amount):
-        self._ensure_operational("withdraw money")
+        self.ensure_operational("withdraw money")
         amount = self._validate_amount(amount)
 
         if amount > self._withdraw_limit:
             raise InvalidOperationError("Withdraw limit exceeded")
 
-        total_amount = amount + self._fixed_fee
+        total_amount = amount + self.withdrawal_fee(amount)
 
-        if self._balance - total_amount < -self._overdraft_limit:
+        if self._balance - total_amount < self.min_allowed_balance:
             raise InsufficientFundsError("Overdraft limit exceeded")
 
         self._balance -= total_amount
-        print(f"Charged {amount}! Fee: {self._fixed_fee}")
+        logger.info(
+            "withdrawal",
+            account_id=self._account_id,
+            amount=amount,
+            fee=self._fixed_fee,
+            currency=self._currency,
+            balance=self._balance,
+        )
+
+    def withdrawal_fee(self, amount) -> Decimal:
+        return self._fixed_fee
+
+    @property
+    def min_allowed_balance(self) -> Decimal:
+        return -self._overdraft_limit
+
+    def get_account_info(self):
+        return str(self)
 
     def __str__(self):
-        return f"""
-            account_type: PREMIUM\n
-            owner_name: {self._owner_name}\n
-            account_id: {self._account_id[-4::]}\n
-            user_id: {self._user_id}\n
-            balance: {self._balance} {self._currency}\n
-            status: {self._status}\n
-            overdraft_limit: {self._overdraft_limit}\n
-            withdraw_limit: {self._withdraw_limit}\n
-            fixed_fee: {self._fixed_fee}\n
-            """
+        return self._format_info(
+            "PREMIUM",
+            overdraft_limit=self._overdraft_limit,
+            withdraw_limit=self._withdraw_limit,
+            fixed_fee=self._fixed_fee,
+        )
 
 
 class InvestmentAccount(BankAccount):
@@ -345,12 +344,9 @@ class InvestmentAccount(BankAccount):
             if asset not in allowed_assets:
                 raise InvalidOperationError("Unknown portfolio asset")
 
-            value = self._to_money(value, "Portfolio asset value cannot be negative")
-
-            if value < 0:
-                raise InvalidOperationError("Portfolio asset value cannot be negative")
-
-            validated_portfolio[asset] = value
+            validated_portfolio[asset] = to_non_negative_money(
+                value, "Portfolio asset value cannot be negative"
+            )
 
         for asset in allowed_assets:
             validated_portfolio.setdefault(asset, Decimal("0.00"))
@@ -371,14 +367,15 @@ class InvestmentAccount(BankAccount):
 
         return projected_growth.quantize(MONEY_PRECISION, rounding=ROUND_HALF_UP)
 
+    def withdraw(self, amount):
+        super().withdraw(amount)
+
+    def get_account_info(self):
+        return str(self)
+
     def __str__(self):
-        return f"""
-            account_type: INVESTMENT\n
-            owner_name: {self._owner_name}\n
-            account_id: {self._account_id[-4::]}\n
-            user_id: {self._user_id}\n
-            balance: {self._balance} {self._currency}\n
-            status: {self._status}\n
-            portfolio: {self._portfolio}\n
-            projected_yearly_growth: {self.project_yearly_growth()}\n
-            """
+        return self._format_info(
+            "INVESTMENT",
+            portfolio=self._portfolio,
+            projected_yearly_growth=self.project_yearly_growth(),
+        )

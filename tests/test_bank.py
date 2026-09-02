@@ -4,8 +4,8 @@ from decimal import Decimal
 import pytest
 
 from src.enums import AccountStatus, ClientStatus, Currency
-from src.exceptions import InvalidOperationError
-from src.models import Bank
+from src.exceptions import AccountClosedError, InvalidOperationError
+from src.models import Bank, CurrencyConverter
 from src.models.accounts import (
     BankAccount,
     InvestmentAccount,
@@ -75,6 +75,30 @@ class TestOpenAccount:
         assert account.account_id in bank_with_client.clients[1].account_ids
         assert account.owner_name == "Max Petrov"
 
+    def test_rejects_duplicate_account_id(self, transfer_bank):
+        transfer_bank.open_account(1, "bank", account_id="ABC123")
+
+        with pytest.raises(InvalidOperationError):
+            transfer_bank.open_account(2, "bank", account_id="ABC123")
+
+    def test_duplicate_attempt_changes_nothing(self, transfer_bank):
+        original = transfer_bank.open_account(
+            1, "bank", account_id="ABC123", balance=Decimal("50000")
+        )
+        accounts_before = len(transfer_bank.accounts)
+        total_before = transfer_bank.get_total_balance()
+
+        with pytest.raises(InvalidOperationError):
+            transfer_bank.open_account(
+                2, "bank", account_id="ABC123", balance=Decimal("10")
+            )
+
+        assert transfer_bank.accounts["ABC123"] is original
+        assert original.balance == Decimal("50000.00")
+        assert len(transfer_bank.accounts) == accounts_before
+        assert transfer_bank.get_total_balance() == total_before
+        assert "ABC123" not in transfer_bank.clients[2].account_ids
+
     def test_rejects_unknown_type(self, bank_with_client):
         with pytest.raises(InvalidOperationError):
             bank_with_client.open_account(1, "crypto")
@@ -137,6 +161,31 @@ class TestAccountLifecycle:
 
         with pytest.raises(InvalidOperationError):
             bank_with_client.unfreeze_account(account.account_id)
+
+    def test_closed_account_cannot_be_frozen(self, bank_with_client):
+        account = bank_with_client.open_account(1, "bank")
+        bank_with_client.close_account(account.account_id)
+
+        with pytest.raises(InvalidOperationError):
+            bank_with_client.freeze_account(account.account_id)
+
+        assert account.status is AccountStatus.CLOSED
+
+    def test_closed_account_cannot_be_revived_through_freezing(self, bank_with_client):
+        account = bank_with_client.open_account(1, "bank")
+        bank_with_client.close_account(account.account_id)
+
+        with pytest.raises(InvalidOperationError):
+            bank_with_client.freeze_account(account.account_id)
+
+        with pytest.raises(InvalidOperationError):
+            bank_with_client.unfreeze_account(account.account_id)
+
+        with pytest.raises(AccountClosedError):
+            account.deposit(Decimal("1000"))
+
+        assert account.status is AccountStatus.CLOSED
+        assert account.balance == Decimal("0.00")
 
     def test_unknown_account_id(self, bank):
         with pytest.raises(InvalidOperationError):
@@ -266,6 +315,45 @@ class TestReports:
 
     def test_total_balance_of_empty_bank(self, bank):
         assert bank.get_total_balance() == Decimal("0.00")
+
+    def test_total_balance_converts_other_currencies(self, bank_with_client):
+        bank_with_client.open_account(1, "bank", balance=Decimal("100"))
+        bank_with_client.open_account(
+            1, "bank", balance=Decimal("1"), currency=Currency.USD
+        )
+
+        assert bank_with_client.get_total_balance() == Decimal("190.00")
+
+    def test_total_balance_can_be_reported_in_any_currency(self, bank_with_client):
+        bank_with_client.open_account(1, "bank", balance=Decimal("900"))
+
+        assert bank_with_client.get_total_balance(Currency.USD) == Decimal("10.00")
+
+    def test_ranking_counts_foreign_accounts(self, bank, make_client):
+        bank.add_client(make_client(client_id=1, full_name="Max Petrov"))
+        bank.add_client(make_client(client_id=2, full_name="Anna Ivanova"))
+        bank.open_account(1, "bank", balance=Decimal("100"))
+        bank.open_account(1, "bank", balance=Decimal("1"), currency=Currency.USD)
+        bank.open_account(2, "bank", balance=Decimal("150"))
+
+        ranking = bank.get_clients_ranking()
+
+        assert [client.client_id for client, _ in ranking] == [1, 2]
+        assert [total for _, total in ranking] == [
+            Decimal("190.00"),
+            Decimal("150.00"),
+        ]
+
+    def test_reports_use_the_injected_converter(self, make_client):
+        converter = CurrencyConverter(
+            {Currency.RUB: Decimal("1"), Currency.USD: Decimal("2")}
+        )
+        bank = Bank("Custom", converter=converter)
+        bank.add_client(make_client())
+        bank.open_account(1, "bank", balance=Decimal("1"), currency=Currency.USD)
+
+        assert bank.converter is converter
+        assert bank.get_total_balance() == Decimal("2.00")
 
     def test_ranking_is_sorted_by_balance(self, bank, make_client):
         bank.add_client(make_client(client_id=1, full_name="Max Petrov"))

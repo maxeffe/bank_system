@@ -1,7 +1,10 @@
-from datetime import datetime
-from decimal import Decimal
+"""Реестр клиентов и счетов.
 
-from src.enums import AccountStatus, ClientStatus, Currency
+Банк хранит участников и владеет жизненным циклом счетов. Всё остальное -
+вход, журнал подозрительных действий, отчёты - делают сервисы из src/services.
+"""
+
+from src.enums import AccountStatus, Currency
 from src.exceptions import InvalidOperationError
 from src.models.accounts import (
     BankAccount,
@@ -10,6 +13,8 @@ from src.models.accounts import (
     SavingsAccount,
 )
 from src.models.client import Client
+from src.models.exchange import CurrencyConverter
+from src.services import AuthService, BankAnalytics, FraudJournal
 
 
 class Bank:
@@ -20,19 +25,38 @@ class Bank:
         "investment": InvestmentAccount,
     }
 
-    def __init__(self, name: str, time_provider=None):
+    def __init__(
+        self,
+        name: str,
+        time_provider=None,
+        converter=None,
+        journal=None,
+        auth_service=None,
+        analytics=None,
+    ):
         if not isinstance(name, str) or not name.strip():
             raise InvalidOperationError("Bank name is required")
 
         self._name = name
         self._clients = {}
         self._accounts = {}
-        self._suspicious_actions = []
-        self._time_provider = time_provider or datetime.now
+
+        self._converter = converter or CurrencyConverter()
+        self._journal = journal or FraudJournal(time_provider)
+        self._auth_service = auth_service or AuthService(self._journal)
+        self._analytics = analytics or BankAnalytics(self._converter)
 
     @property
     def name(self):
         return self._name
+
+    @property
+    def converter(self):
+        return self._converter
+
+    @property
+    def journal(self):
+        return self._journal
 
     @property
     def clients(self):
@@ -44,10 +68,10 @@ class Bank:
 
     @property
     def suspicious_actions(self):
-        return self._suspicious_actions.copy()
+        return self._journal.actions
 
     def add_client(self, client):
-        self._check_restricted_time("add_client")
+        self._journal.ensure_allowed_time("add_client")
 
         if not isinstance(client, Client):
             raise InvalidOperationError("Invalid client")
@@ -59,9 +83,9 @@ class Bank:
         return client
 
     def open_account(self, client_id, account_type="bank", **account_data):
-        self._check_restricted_time("open_account", client_id)
+        self._journal.ensure_allowed_time("open_account", client_id)
         client = self._get_client(client_id)
-        self._ensure_client_can_operate(client, "open_account")
+        self._auth_service.ensure_can_operate(client, "open_account")
 
         account_class = self._ACCOUNT_TYPES.get(account_type)
 
@@ -74,12 +98,15 @@ class Bank:
             **account_data,
         )
 
+        if account.account_id in self._accounts:
+            raise InvalidOperationError("Account id already exists")
+
         self._accounts[account.account_id] = account
         client.add_account_id(account.account_id)
         return account
 
     def close_account(self, account_id):
-        self._check_restricted_time("close_account")
+        self._journal.ensure_allowed_time("close_account")
         account = self._get_account(account_id)
 
         if account.balance != 0:
@@ -91,13 +118,13 @@ class Bank:
         return account
 
     def freeze_account(self, account_id):
-        self._check_restricted_time("freeze_account")
+        self._journal.ensure_allowed_time("freeze_account")
         account = self._get_account(account_id)
         account.status = AccountStatus.FROZEN
         return account
 
     def unfreeze_account(self, account_id):
-        self._check_restricted_time("unfreeze_account")
+        self._journal.ensure_allowed_time("unfreeze_account")
         account = self._get_account(account_id)
 
         if account.status is AccountStatus.CLOSED:
@@ -107,23 +134,7 @@ class Bank:
         return account
 
     def authenticate_client(self, client_id, password):
-        client = self._get_client(client_id)
-
-        if client.status is ClientStatus.BLOCKED:
-            self._mark_suspicious(client, "blocked_client_login")
-            raise InvalidOperationError("Client is blocked")
-
-        if client.check_password(password):
-            client.reset_failed_logins()
-            return True
-
-        client.register_failed_login()
-        self._mark_suspicious(client, "failed_login")
-
-        if client.status is ClientStatus.BLOCKED:
-            self._record_suspicious_action(client, "client_blocked_after_failed_logins")
-
-        return False
+        return self._auth_service.authenticate(self._get_client(client_id), password)
 
     def search_accounts(
         self,
@@ -165,31 +176,16 @@ class Bank:
 
         return accounts
 
-    def get_total_balance(self):
-        return sum(
-            (
-                account.balance
-                for account in self._accounts.values()
-                if account.status is not AccountStatus.CLOSED
-            ),
-            Decimal("0.00"),
+    def get_total_balance(self, currency=Currency.RUB):
+        return self._analytics.total_balance(self._accounts.values(), currency)
+
+    def get_clients_ranking(self, currency=Currency.RUB):
+        return self._analytics.clients_ranking(
+            self._clients.values(), self._accounts, currency
         )
 
-    def get_clients_ranking(self):
-        ranking = []
-
-        for client in self._clients.values():
-            total_balance = Decimal("0.00")
-
-            for account_id in client.account_ids:
-                account = self._accounts.get(account_id)
-
-                if account is not None and account.status is not AccountStatus.CLOSED:
-                    total_balance += account.balance
-
-            ranking.append((client, total_balance))
-
-        return sorted(ranking, key=lambda item: item[1], reverse=True)
+    def get_account(self, account_id):
+        return self._get_account(account_id)
 
     def _get_client(self, client_id):
         client = self._clients.get(client_id)
@@ -206,39 +202,3 @@ class Bank:
             raise InvalidOperationError("Account not found")
 
         return account
-
-    def _ensure_client_can_operate(self, client, action):
-        if client.status is ClientStatus.BLOCKED:
-            self._mark_suspicious(client, action)
-            raise InvalidOperationError("Blocked client cannot operate")
-
-    def _is_restricted_time(self):
-        current_hour = self._time_provider().hour
-        return 0 <= current_hour < 5
-
-    def _check_restricted_time(self, action, client_id=None):
-        if self._is_restricted_time():
-            self._record_suspicious_action_by_id(client_id, f"restricted_time:{action}")
-            raise InvalidOperationError("Operations are blocked from 00:00 to 05:00")
-
-    def _mark_suspicious(self, client, action):
-        client.mark_suspicious()
-        self._record_suspicious_action(client, action)
-
-    def _record_suspicious_action(self, client, action):
-        self._suspicious_actions.append(
-            {
-                "client_id": client.client_id,
-                "action": action,
-                "time": self._time_provider().isoformat(timespec="seconds"),
-            }
-        )
-
-    def _record_suspicious_action_by_id(self, client_id, action):
-        self._suspicious_actions.append(
-            {
-                "client_id": client_id,
-                "action": action,
-                "time": self._time_provider().isoformat(timespec="seconds"),
-            }
-        )
