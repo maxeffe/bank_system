@@ -187,6 +187,23 @@ class BankAccount(AbstractAccount):
             balance=self._balance,
         )
 
+    def refund(self, amount):
+        """Возврат ранее списанного.
+
+        Статус счёта не проверяется намеренно: это не пополнение от клиента,
+        а отмена собственного списания банка. Если операция не удалась,
+        деньги обязаны вернуться даже на замороженный счёт.
+        """
+        amount = self._validate_amount(amount)
+        self._balance += amount
+        logger.info(
+            "refund",
+            account_id=self._account_id,
+            amount=amount,
+            currency=self._currency,
+            balance=self._balance,
+        )
+
     def get_account_info(self):
         return str(self)
 

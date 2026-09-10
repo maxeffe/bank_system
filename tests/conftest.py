@@ -32,9 +32,18 @@ def make_client():
     return factory
 
 
+DAYTIME = datetime(2026, 9, 3, 12, 0)
+
+
 @pytest.fixture
-def bank():
-    return Bank("Test Bank")
+def daytime():
+    """Часы, застывшие в полдень: тесты не должны зависеть от времени суток."""
+    return lambda: DAYTIME
+
+
+@pytest.fixture
+def bank(daytime):
+    return Bank("Test Bank", time_provider=daytime)
 
 
 @pytest.fixture

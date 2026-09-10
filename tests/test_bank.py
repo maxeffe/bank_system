@@ -344,11 +344,11 @@ class TestReports:
             Decimal("150.00"),
         ]
 
-    def test_reports_use_the_injected_converter(self, make_client):
+    def test_reports_use_the_injected_converter(self, make_client, daytime):
         converter = CurrencyConverter(
             {Currency.RUB: Decimal("1"), Currency.USD: Decimal("2")}
         )
-        bank = Bank("Custom", converter=converter)
+        bank = Bank("Custom", converter=converter, time_provider=daytime)
         bank.add_client(make_client())
         bank.open_account(1, "bank", balance=Decimal("1"), currency=Currency.USD)
 

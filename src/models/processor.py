@@ -2,6 +2,8 @@ from contextlib import contextmanager
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 
+from loguru import logger
+
 from src.enums import Currency, TransactionType
 from src.exceptions import (
     InsufficientFundsError,
@@ -67,8 +69,9 @@ class TransactionProcessor:
     def convert(self, amount, from_currency, to_currency):
         return self._converter.convert(amount, from_currency, to_currency)
 
-    def process(self, transaction):
-        transaction.mark_processing(now=self._time_provider())
+    def process(self, transaction, now: datetime = None):
+        moment = now or self._time_provider()
+        transaction.mark_processing(now=moment)
         last_error = None
 
         for _ in range(self._max_attempts):
@@ -96,17 +99,18 @@ class TransactionProcessor:
         if not isinstance(queue, TransactionQueue):
             raise InvalidOperationError("Invalid transaction queue")
 
+        moment = now or self._time_provider()
         summary = {"processed": 0, "completed": 0, "failed": 0}
 
         while True:
-            transaction = queue.pop_ready(now)
+            transaction = queue.pop_ready(moment)
 
             if transaction is None:
                 break
 
             summary["processed"] += 1
 
-            if self.process(transaction):
+            if self.process(transaction, now=moment):
                 summary["completed"] += 1
             else:
                 summary["failed"] += 1
@@ -114,6 +118,7 @@ class TransactionProcessor:
         return summary
 
     def _execute(self, transaction):
+        self._bank.journal.ensure_allowed_time("process_transaction")
         transaction.apply_fee(self.calculate_fee(transaction))
         self._handlers[transaction.transaction_type](transaction)
 
@@ -122,27 +127,34 @@ class TransactionProcessor:
         target.deposit(self._to_account_money(transaction.amount, transaction, target))
 
     def _execute_withdrawal(self, transaction):
-        source = self._get_account(transaction.source_account_id)
+        source = self._get_source(transaction.source_account_id)
         total = self._to_account_money(transaction.total_amount, transaction, source)
 
         self._ensure_can_send(source, total)
         source.withdraw(total)
 
     def _execute_transfer(self, transaction):
-        source = self._get_account(transaction.source_account_id)
+        source = self._get_source(transaction.source_account_id)
         target = self._get_account(transaction.target_account_id)
 
         source.ensure_operational("send money")
         target.ensure_operational("receive money")
 
-        total = self._to_account_money(transaction.total_amount, transaction, source)
         credited = self._to_account_money(transaction.amount, transaction, target)
 
-        with self._debit(source, total):
+        if credited <= 0:
+            raise InvalidOperationError("Amount is too small for the target currency")
+
+        # Получатель может принять только целые копейки своей валюты. Списываем
+        # ровно столько, сколько эти копейки стоят, иначе деньги возникают из воздуха.
+        sent = self._converter.convert(credited, target.currency, source.currency)
+        fee = self._to_account_money(transaction.fee, transaction, source)
+
+        with self._debit(source, sent + fee):
             target.deposit(credited)
 
     def _execute_external_transfer(self, transaction):
-        source = self._get_account(transaction.source_account_id)
+        source = self._get_source(transaction.source_account_id)
         total = self._to_account_money(transaction.total_amount, transaction, source)
 
         with self._debit(source, total):
@@ -162,7 +174,16 @@ class TransactionProcessor:
         try:
             yield
         except Exception:
-            source.deposit(debited)
+            try:
+                source.refund(debited)
+            except Exception as refund_error:
+                logger.error(
+                    "refund_failed",
+                    account_id=source.account_id,
+                    amount=debited,
+                    reason=str(refund_error),
+                )
+
             raise
 
     def _to_account_money(self, amount, transaction, account):
@@ -177,6 +198,12 @@ class TransactionProcessor:
 
     def _get_account(self, account_id):
         return self._bank.get_account(account_id)
+
+    def _get_source(self, account_id):
+        """Счёт, с которого уходят деньги: владелец должен быть не заблокирован."""
+        account = self._get_account(account_id)
+        self._bank.ensure_client_can_operate(account.user_id, "send money")
+        return account
 
     def _fail(self, transaction, error, already_logged=False):
         reason = str(error) if error else "Unknown processing error"

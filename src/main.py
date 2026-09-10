@@ -20,7 +20,10 @@ from src.models import (
 
 configure_logging()
 
-bank = Bank("ItGrind Bank")
+# Демо не должно зависеть от времени суток: ночью операции запрещены.
+DEMO_TIME = datetime(2026, 9, 3, 12, 0)
+
+bank = Bank("ItGrind Bank", time_provider=lambda: DEMO_TIME)
 
 client_max = Client(
     client_id=1,
@@ -161,7 +164,7 @@ print(f"Night suspicious actions: {night_bank.suspicious_actions}")
 
 print("\n--- Day 4: transactions ---")
 
-transaction_bank = Bank("ItGrind Bank")
+transaction_bank = Bank("ItGrind Bank", time_provider=lambda: DEMO_TIME)
 transaction_bank.add_client(
     Client(
         client_id=1,

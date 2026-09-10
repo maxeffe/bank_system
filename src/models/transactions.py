@@ -192,6 +192,9 @@ class Transaction:
         if not self.is_open:
             raise InvalidOperationError("Only an open transaction can be processed")
 
+        if not self.is_ready(now or self._time_provider()):
+            raise InvalidOperationError("Scheduled transaction is not due yet")
+
         self._status = TransactionStatus.PROCESSING
         self._touch(now)
 

@@ -136,6 +136,9 @@ class Bank:
     def authenticate_client(self, client_id, password):
         return self._auth_service.authenticate(self._get_client(client_id), password)
 
+    def ensure_client_can_operate(self, client_id, action):
+        self._auth_service.ensure_can_operate(self._get_client(client_id), action)
+
     def search_accounts(
         self,
         client_id=None,

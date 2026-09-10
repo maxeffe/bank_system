@@ -46,12 +46,14 @@ class TransactionQueue:
         return transaction
 
     def cancel(self, transaction_id, reason="Cancelled by user"):
-        transaction = self._by_id.pop(transaction_id, None)
+        transaction = self._by_id.get(transaction_id)
 
         if transaction is None:
             raise InvalidOperationError("Transaction not found in queue")
 
+        # Сначала меняем статус: если переход запрещён, запись остаётся в очереди.
         transaction.cancel(reason, now=self._time_provider())
+        del self._by_id[transaction_id]
         return transaction
 
     def pop_ready(self, now: datetime = None):
@@ -64,6 +66,10 @@ class TransactionQueue:
             transaction = self._by_id.get(entry[2])
 
             if transaction is None:
+                continue
+
+            if not transaction.is_open:
+                del self._by_id[transaction.transaction_id]
                 continue
 
             if not transaction.is_ready(now):
@@ -85,11 +91,11 @@ class TransactionQueue:
         return [
             self._by_id[transaction_id]
             for _, _, transaction_id in sorted(self._heap)
-            if transaction_id in self._by_id
+            if transaction_id in self._by_id and self._by_id[transaction_id].is_open
         ]
 
     def __len__(self):
-        return len(self._by_id)
+        return sum(1 for t in self._by_id.values() if t.is_open)
 
     def __contains__(self, transaction_id):
         return transaction_id in self._by_id
