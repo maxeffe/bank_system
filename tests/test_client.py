@@ -13,7 +13,6 @@ class TestClientCreation:
         assert client.full_name == "Max Petrov"
         assert client.age == 30
         assert client.status is ClientStatus.ACTIVE
-        assert client.account_ids == []
         assert client.failed_login_attempts == 0
 
     @pytest.mark.parametrize("age", [0, 17, -5])
@@ -201,28 +200,3 @@ class TestStatusChanges:
 
         with pytest.raises(InvalidOperationError):
             client.status = "blocked"
-
-
-class TestAccountIds:
-    def test_adds_account_id(self, make_client):
-        client = make_client()
-
-        client.add_account_id("abc123")
-
-        assert client.account_ids == ["abc123"]
-
-    def test_does_not_duplicate(self, make_client):
-        client = make_client()
-
-        client.add_account_id("abc123")
-        client.add_account_id("abc123")
-
-        assert client.account_ids == ["abc123"]
-
-    def test_getter_returns_a_copy(self, make_client):
-        client = make_client()
-        client.add_account_id("abc123")
-
-        client.account_ids.append("hacked")
-
-        assert client.account_ids == ["abc123"]

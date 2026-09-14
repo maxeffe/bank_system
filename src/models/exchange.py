@@ -32,9 +32,10 @@ class CurrencyConverter:
     def rates(self):
         return self._rates.copy()
 
-    def convert(self, amount, from_currency, to_currency):
+    def convert(self, amount, from_currency, to_currency, rounding=ROUND_HALF_UP):
+        """rounding - как округлять до копеек: зачисление вниз, списание вверх."""
         if from_currency is to_currency:
-            return Decimal(amount).quantize(MONEY_PRECISION, rounding=ROUND_HALF_UP)
+            return Decimal(amount).quantize(MONEY_PRECISION, rounding=rounding)
 
         for currency in (from_currency, to_currency):
             if currency not in self._rates:
@@ -42,5 +43,5 @@ class CurrencyConverter:
 
         in_rubles = Decimal(amount) * self._rates[from_currency]
         return (in_rubles / self._rates[to_currency]).quantize(
-            MONEY_PRECISION, rounding=ROUND_HALF_UP
+            MONEY_PRECISION, rounding=rounding
         )

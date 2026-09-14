@@ -9,6 +9,7 @@ from src.exceptions import (
     InsufficientFundsError,
     InvalidOperationError,
 )
+from src.money import MAX_MONEY, MONEY_LIMIT_MESSAGE
 from src.models.accounts import (
     BankAccount,
     InvestmentAccount,
@@ -112,6 +113,23 @@ class TestBankAccountOperations:
 
         assert account.balance == Decimal("100.00")
 
+    @pytest.mark.parametrize("operation", ["deposit", "refund"])
+    def test_balance_cannot_pass_the_money_limit(self, operation):
+        account = make_bank_account(balance=MAX_MONEY)
+
+        with pytest.raises(InvalidOperationError, match=MONEY_LIMIT_MESSAGE):
+            getattr(account, operation)(Decimal("0.01"))
+
+        assert account.balance == MAX_MONEY
+
+    def test_interest_cannot_pass_the_money_limit(self):
+        account = SavingsAccount(user_id=1, owner_name="Anna", balance=MAX_MONEY)
+
+        with pytest.raises(InvalidOperationError, match=MONEY_LIMIT_MESSAGE):
+            account.apply_monthly_interest()
+
+        assert account.balance == MAX_MONEY
+
     @pytest.mark.parametrize("amount", [Decimal("0"), Decimal("-10")])
     def test_non_positive_amount_fails(self, amount):
         account = make_bank_account()
@@ -132,7 +150,7 @@ class TestAccountStatusGuard:
             account.withdraw(Decimal("10"))
 
     def test_closed_blocks_deposit_and_withdraw(self):
-        account = make_bank_account()
+        account = make_bank_account(balance=Decimal("0"))
         account.status = AccountStatus.CLOSED
 
         with pytest.raises(AccountClosedError):
@@ -143,7 +161,7 @@ class TestAccountStatusGuard:
 
     @pytest.mark.parametrize("new_status", [AccountStatus.ACTIVE, AccountStatus.FROZEN])
     def test_closed_is_terminal(self, new_status):
-        account = make_bank_account()
+        account = make_bank_account(balance=Decimal("0"))
         account.status = AccountStatus.CLOSED
 
         with pytest.raises(InvalidOperationError):
@@ -152,10 +170,27 @@ class TestAccountStatusGuard:
         assert account.status is AccountStatus.CLOSED
 
     def test_closing_twice_is_allowed(self):
-        account = make_bank_account()
+        account = make_bank_account(balance=Decimal("0"))
         account.status = AccountStatus.CLOSED
 
         account.status = AccountStatus.CLOSED
+
+        assert account.status is AccountStatus.CLOSED
+
+    def test_account_with_money_cannot_be_closed(self):
+        account = make_bank_account()
+
+        with pytest.raises(InvalidOperationError):
+            account.status = AccountStatus.CLOSED
+
+        assert account.status is AccountStatus.ACTIVE
+
+    def test_account_with_money_cannot_be_created_closed(self):
+        with pytest.raises(InvalidOperationError):
+            make_bank_account(status=AccountStatus.CLOSED)
+
+    def test_empty_account_can_be_created_closed(self):
+        account = make_bank_account(balance=Decimal("0"), status=AccountStatus.CLOSED)
 
         assert account.status is AccountStatus.CLOSED
 
@@ -233,10 +268,7 @@ class TestSavingsAccount:
 
     @pytest.mark.parametrize(
         "status, error",
-        [
-            (AccountStatus.FROZEN, AccountFrozenError),
-            (AccountStatus.CLOSED, AccountClosedError),
-        ],
+        [(AccountStatus.FROZEN, AccountFrozenError)],
     )
     def test_status_is_checked_before_min_balance(self, status, error):
         account = SavingsAccount(
@@ -417,3 +449,40 @@ class TestPolymorphism:
 
         assert plain.balance == Decimal("900.00")
         assert premium.balance == Decimal("875.00")
+
+
+class TestWithdrawTemplate:
+    """Одно правило снятия: тип счёта меняет только хуки."""
+
+    def test_withdraw_returns_what_left_the_account(self):
+        account = PremiumAccount(
+            user_id=1,
+            owner_name="Anna",
+            balance=Decimal("1000"),
+            fixed_fee=Decimal("25"),
+        )
+
+        assert account.withdraw(Decimal("100")) == Decimal("125.00")
+        assert account.balance == Decimal("875.00")
+
+    def test_frozen_premium_reports_status_before_limit(self):
+        account = PremiumAccount(
+            user_id=1,
+            owner_name="Anna",
+            balance=Decimal("1000"),
+            withdraw_limit=Decimal("10"),
+        )
+        account.status = AccountStatus.FROZEN
+
+        with pytest.raises(AccountFrozenError):
+            account.withdraw(Decimal("500"))
+
+    def test_fee_counts_against_the_balance(self):
+        account = PremiumAccount(
+            user_id=1, owner_name="Anna", balance=Decimal("100"), fixed_fee=Decimal("1")
+        )
+
+        with pytest.raises(InsufficientFundsError):
+            account.withdraw(Decimal("100"))
+
+        assert account.balance == Decimal("100.00")

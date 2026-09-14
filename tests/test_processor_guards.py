@@ -8,6 +8,7 @@ import pytest
 from src.enums import ClientStatus, TransactionStatus, TransactionType
 from src.exceptions import InvalidOperationError
 from src.models import Bank, Transaction, TransactionProcessor
+from src.services.fraud import FRAUD_EVENT
 
 DAYTIME = datetime(2026, 9, 3, 12, 0)
 NIGHT = datetime(2026, 9, 3, 2, 0)
@@ -62,6 +63,18 @@ def transfer(source, target, amount="5000", **kwargs):
 
 
 class TestBlockedClient:
+    def test_blocked_sender_record_uses_the_process_moment(
+        self, processor, guarded_bank, source, target
+    ):
+        guarded_bank.clients[1].status = ClientStatus.BLOCKED
+        later = DAYTIME + timedelta(hours=1)
+
+        processor.process(transfer(source, target), now=later)
+
+        times = [record["time"] for record in guarded_bank.audit_log.records]
+        assert guarded_bank.audit_log.filter(event=FRAUD_EVENT)[-1]["time"] == later
+        assert times == sorted(times)
+
     def test_blocked_owner_cannot_send(self, processor, guarded_bank, source, target):
         guarded_bank.clients[1].status = ClientStatus.BLOCKED
         transaction = transfer(source, target)
@@ -107,6 +120,31 @@ class TestBlockedClient:
 
 
 class TestRestrictedTime:
+    def test_ban_follows_the_process_moment(self, processor, source, target):
+        transaction = transfer(source, target)
+
+        assert processor.process(transaction, now=NIGHT) is False
+        assert (
+            transaction.failure_reason == "Operations are blocked from 00:00 to 05:00"
+        )
+        assert source.balance == Decimal("10000.00")
+
+    def test_daytime_moment_is_not_banned_by_a_night_clock(
+        self, processor, clock, source, target
+    ):
+        clock.moment = NIGHT
+
+        assert processor.process(transfer(source, target), now=DAYTIME) is True
+
+    def test_night_record_names_the_client_and_the_moment(
+        self, processor, guarded_bank, source, target
+    ):
+        processor.process(transfer(source, target), now=NIGHT)
+
+        record = guarded_bank.audit_log.filter(event=FRAUD_EVENT)[-1]
+        assert record["time"] == NIGHT
+        assert record in guarded_bank.get_suspicious_operations(1)
+
     def test_night_transfer_is_refused(self, processor, clock, source, target):
         clock.moment = NIGHT
         transaction = transfer(source, target)

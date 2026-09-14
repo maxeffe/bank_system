@@ -3,6 +3,10 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from src.exceptions import InvalidOperationError
 
 MONEY_PRECISION = Decimal("0.01")
+# Потолок сумм и балансов: с ним Decimal (28 знаков) всегда считает точно,
+# а не округляет молча.
+MAX_MONEY = Decimal(10**15)
+MONEY_LIMIT_MESSAGE = "Amount exceeds the money limit"
 
 
 def is_valid_money(value) -> bool:
@@ -24,9 +28,14 @@ def to_money(value, error_message: str) -> Decimal:
         raise InvalidOperationError(error_message)
 
     try:
-        return Decimal(value).quantize(MONEY_PRECISION, rounding=ROUND_HALF_UP)
+        amount = Decimal(value).quantize(MONEY_PRECISION, rounding=ROUND_HALF_UP)
     except InvalidOperation:
         raise InvalidOperationError(error_message) from None
+
+    if abs(amount) > MAX_MONEY:
+        raise InvalidOperationError(MONEY_LIMIT_MESSAGE)
+
+    return amount
 
 
 def to_rate(value, error_message: str) -> Decimal:

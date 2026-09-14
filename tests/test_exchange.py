@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal
 
 import pytest
 
@@ -75,3 +75,23 @@ class TestConversion:
 
         with pytest.raises(CurrencyConversionError):
             converter.convert(Decimal("100"), Currency.RUB, Currency.USD)
+
+
+class TestRounding:
+    @pytest.mark.parametrize(
+        ("rounding", "expected"),
+        [(ROUND_HALF_UP, "1.11"), (ROUND_DOWN, "1.11"), (ROUND_UP, "1.12")],
+    )
+    def test_rounding_mode_is_applied(self, rounding, expected):
+        converter = CurrencyConverter()
+
+        result = converter.convert(Decimal("100"), Currency.RUB, Currency.USD, rounding)
+
+        assert result == Decimal(expected)
+
+    def test_default_is_half_up(self):
+        converter = CurrencyConverter()
+
+        assert converter.convert(Decimal("50"), Currency.EUR, Currency.USD) == Decimal(
+            "55.56"
+        )

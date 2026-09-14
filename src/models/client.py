@@ -54,7 +54,6 @@ class Client:
         self._password_salt = secrets.token_bytes(PASSWORD_SALT_BYTES)
         self._password_hash = self._hash_password(password, self._password_salt)
         self._status = status
-        self._account_ids = []
         self._failed_login_attempts = 0
 
     @property
@@ -72,10 +71,6 @@ class Client:
     @property
     def contacts(self):
         return self._contacts.copy()
-
-    @property
-    def account_ids(self):
-        return self._account_ids.copy()
 
     @property
     def failed_login_attempts(self):
@@ -132,10 +127,6 @@ class Client:
         candidate = self._hash_password(password, self._password_salt)
         return hmac.compare_digest(candidate, self._password_hash)
 
-    def add_account_id(self, account_id):
-        if account_id not in self._account_ids:
-            self._account_ids.append(account_id)
-
     def register_failed_login(self):
         self._failed_login_attempts += 1
 
@@ -150,11 +141,4 @@ class Client:
             self._status = ClientStatus.SUSPICIOUS
 
     def __str__(self):
-        return f"""
-            client_id: {self._client_id}\n
-            full_name: {self._full_name}\n
-            age: {self._age}\n
-            status: {self._status}\n
-            accounts: {self._account_ids}\n
-            contacts: {self._contacts}\n
-            """
+        return f"Client {self._client_id} {self._full_name} ({self._status})"

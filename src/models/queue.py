@@ -1,6 +1,8 @@
 import heapq
 from datetime import datetime
 
+from loguru import logger
+
 from src.enums import TransactionStatus
 from src.exceptions import InvalidOperationError
 from src.models.transactions import Transaction
@@ -43,6 +45,15 @@ class TransactionQueue:
             self._heap,
             (transaction.priority_rank, self._counter, transaction.transaction_id),
         )
+        logger.info(
+            "transaction_queued",
+            transaction_id=transaction.transaction_id,
+            transaction_type=transaction.transaction_type,
+            amount=transaction.amount,
+            currency=transaction.currency,
+            priority=transaction.priority,
+            scheduled_at=transaction.scheduled_at,
+        )
         return transaction
 
     def cancel(self, transaction_id, reason="Cancelled by user"):
@@ -54,6 +65,11 @@ class TransactionQueue:
         # Сначала меняем статус: если переход запрещён, запись остаётся в очереди.
         transaction.cancel(reason, now=self._time_provider())
         del self._by_id[transaction_id]
+        logger.info(
+            "transaction_cancelled",
+            transaction_id=transaction_id,
+            reason=transaction.failure_reason,
+        )
         return transaction
 
     def pop_ready(self, now: datetime = None):

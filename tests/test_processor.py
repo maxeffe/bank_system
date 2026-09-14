@@ -4,18 +4,17 @@ from decimal import Decimal
 import pytest
 
 from src.enums import (
-    AccountStatus,
     Currency,
     TransactionPriority,
     TransactionStatus,
     TransactionType,
 )
 from src.exceptions import (
-    CurrencyConversionError,
     InvalidOperationError,
     TransientTransactionError,
 )
 from src.models import Transaction, TransactionProcessor
+from src.models.processor import DEFAULT_MAX_ATTEMPTS
 
 NOW = datetime(2026, 9, 3, 12, 0)
 
@@ -42,6 +41,43 @@ def transfer(source, target, amount="500", **kwargs):
         target_account_id=target.account_id,
         **kwargs,
     )
+
+
+def mixed_transactions(source, target, savings, frozen):
+    """Десять транзакций: успешные, ошибочные, отменённая и отложенная."""
+    cancelled = transfer(source, target, "300")
+    scheduled = transfer(source, target, "400", scheduled_at=NOW + timedelta(days=1))
+
+    transactions = [
+        transfer(
+            source,
+            target,
+            "500",
+            priority=TransactionPriority.HIGH,
+        ),
+        Transaction(
+            TransactionType.DEPOSIT,
+            Decimal("250"),
+            target_account_id=target.account_id,
+        ),
+        Transaction(
+            TransactionType.WITHDRAWAL,
+            Decimal("100"),
+            source_account_id=source.account_id,
+        ),
+        Transaction(
+            TransactionType.EXTERNAL_TRANSFER,
+            Decimal("1000"),
+            source_account_id=source.account_id,
+        ),
+        transfer(source, savings, "200"),
+        transfer(source, frozen, "150"),
+        transfer(savings, target, "1500"),
+        transfer(source, target, "999999"),
+        cancelled,
+        scheduled,
+    ]
+    return transactions, cancelled, scheduled
 
 
 class TestFees:
@@ -86,36 +122,6 @@ class TestFees:
         )
 
         assert processor.calculate_fee(transaction) == Decimal("0.56")
-
-
-class TestConversion:
-    def test_same_currency_is_unchanged(self, processor):
-        assert processor.convert(Decimal("100"), Currency.RUB, Currency.RUB) == Decimal(
-            "100.00"
-        )
-
-    def test_rub_to_usd(self, processor):
-        assert processor.convert(Decimal("900"), Currency.RUB, Currency.USD) == Decimal(
-            "10.00"
-        )
-
-    def test_usd_to_rub(self, processor):
-        assert processor.convert(Decimal("10"), Currency.USD, Currency.RUB) == Decimal(
-            "900.00"
-        )
-
-    def test_usd_to_eur(self, processor):
-        assert processor.convert(Decimal("100"), Currency.USD, Currency.EUR) == Decimal(
-            "90.00"
-        )
-
-    def test_unknown_rate_fails(self, transfer_bank):
-        processor = TransactionProcessor(
-            transfer_bank, exchange_rates={Currency.RUB: Decimal("1")}
-        )
-
-        with pytest.raises(CurrencyConversionError):
-            processor.convert(Decimal("100"), Currency.RUB, Currency.USD)
 
 
 class TestExecution:
@@ -214,8 +220,9 @@ class TestRules:
     def test_closed_account_blocks_transfer(
         self, processor, transfer_bank, source_account, target_account
     ):
-        target_account.status = AccountStatus.CLOSED
-        transaction = transfer(source_account, target_account)
+        closed = transfer_bank.open_account(2, "bank")
+        transfer_bank.close_account(closed.account_id)
+        transaction = transfer(source_account, closed)
 
         assert processor.process(transaction) is False
         assert "Closed" in transaction.failure_reason
@@ -226,7 +233,7 @@ class TestRules:
         transaction = transfer(source_account, target_account, "10001")
 
         assert processor.process(transaction) is False
-        assert transaction.failure_reason == "Transfer would break the balance limit"
+        assert transaction.failure_reason == "Not enough money to withdraw"
         assert source_account.balance == Decimal("10000.00")
 
     def test_savings_keeps_its_minimum_on_transfer(self, transfer_bank, target_account):
@@ -506,40 +513,9 @@ class TestProcessQueue:
         frozen = transfer_bank.open_account(2, "bank", balance=Decimal("500"))
         transfer_bank.freeze_account(frozen.account_id)
 
-        cancelled = transfer(source_account, target_account, "300")
-        scheduled = transfer(
-            source_account, target_account, "400", scheduled_at=NOW + timedelta(days=1)
+        transactions, cancelled, scheduled = mixed_transactions(
+            source_account, target_account, savings, frozen
         )
-
-        transactions = [
-            transfer(
-                source_account,
-                target_account,
-                "500",
-                priority=TransactionPriority.HIGH,
-            ),
-            Transaction(
-                TransactionType.DEPOSIT,
-                Decimal("250"),
-                target_account_id=target_account.account_id,
-            ),
-            Transaction(
-                TransactionType.WITHDRAWAL,
-                Decimal("100"),
-                source_account_id=source_account.account_id,
-            ),
-            Transaction(
-                TransactionType.EXTERNAL_TRANSFER,
-                Decimal("1000"),
-                source_account_id=source_account.account_id,
-            ),
-            transfer(source_account, savings, "200"),
-            transfer(source_account, frozen, "150"),
-            transfer(savings, target_account, "1500"),
-            transfer(source_account, target_account, "999999"),
-            cancelled,
-            scheduled,
-        ]
 
         for transaction in transactions:
             queue.add(transaction)
@@ -558,3 +534,46 @@ class TestProcessQueue:
         assert target_account.balance == Decimal("1000") + Decimal("750")
         assert savings.balance == Decimal("2200.00")
         assert frozen.balance == Decimal("500.00")
+
+
+class TestProcessorClock:
+    """Часы процессора по умолчанию - часы банка; один момент на весь process()."""
+
+    def test_default_clock_is_the_bank_clock(
+        self, transfer_bank, source_account, target_account
+    ):
+        processor = TransactionProcessor(transfer_bank)
+        transaction = transfer(source_account, target_account)
+
+        processor.process(transaction)
+
+        assert transaction.completed_at == transfer_bank.time_provider()
+
+    def test_explicit_moment_is_used_for_every_step(
+        self, transfer_bank, source_account, target_account
+    ):
+        later = transfer_bank.time_provider() + timedelta(hours=1)
+        processor = TransactionProcessor(transfer_bank)
+        transaction = transfer(source_account, target_account, "999999")
+
+        processor.process(transaction, now=later)
+
+        assert transaction.updated_at == later
+        assert processor.errors[0]["time"] == later.isoformat(timespec="seconds")
+
+    def test_retries_keep_the_same_moment(self, transfer_bank, source_account):
+        later = transfer_bank.time_provider() + timedelta(hours=1)
+        processor = TransactionProcessor(
+            transfer_bank, external_gateway=FlakyGateway(failures=99)
+        )
+        transaction = Transaction(
+            TransactionType.EXTERNAL_TRANSFER,
+            Decimal("1000"),
+            source_account_id=source_account.account_id,
+        )
+
+        processor.process(transaction, now=later)
+
+        times = [error["time"] for error in processor.errors]
+        assert times == [later.isoformat(timespec="seconds")] * DEFAULT_MAX_ATTEMPTS
+        assert transaction.updated_at == later

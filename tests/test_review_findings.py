@@ -1,7 +1,7 @@
 """Регрессии, найденные коллегией ревьюеров."""
 
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 import pytest
 
@@ -71,9 +71,9 @@ class TestCrossCurrencyConservesMoney:
     def test_sender_pays_what_the_receiver_gets(self, bank, processor, rub):
         eur = bank.open_account(1, "bank", balance=Decimal("0"), currency=Currency.EUR)
 
-        processor.process(transfer(rub, eur, "0.50"))
+        processor.process(transfer(rub, eur, "1.50"))
 
-        # 0.01 EUR по курсу 100 стоит ровно 1.00 RUB
+        # 1.50 RUB = 0.015 EUR, зачисление вниз: 0.01 EUR, а стоит она ровно 1.00 RUB
         assert eur.balance == Decimal("0.01")
         assert rub.balance == Decimal("999.00")
 
@@ -240,3 +240,94 @@ class TestQueueDropsClosedTransactions:
         assert transaction.status is TransactionStatus.CANCELLED
         assert len(queue) == 0
         assert transaction.transaction_id not in queue
+
+
+class TestConversionRounding:
+    """Зачисление округляется вниз, списание вверх: банк не создаёт деньги."""
+
+    @pytest.fixture
+    def accounts(self, bank):
+        def factory(source_currency, target_currency):
+            source = bank.open_account(
+                1, "bank", balance=Decimal("1000"), currency=source_currency
+            )
+            target = bank.open_account(
+                1, "bank", balance=Decimal("0"), currency=target_currency
+            )
+            return source, target
+
+        return factory
+
+    def test_eur_to_usd_credits_down_and_debits_the_value(self, processor, accounts):
+        eur, usd = accounts(Currency.EUR, Currency.USD)
+        transaction_in_eur = Transaction(
+            TransactionType.TRANSFER,
+            Decimal("50"),
+            currency=Currency.EUR,
+            source_account_id=eur.account_id,
+            target_account_id=usd.account_id,
+        )
+
+        processor.process(transaction_in_eur)
+
+        # 50 EUR = 55.555 USD -> 55.55; они стоят 49.995 EUR -> списано 50.00
+        assert usd.balance == Decimal("55.55")
+        assert eur.balance == Decimal("950.00")
+
+    @pytest.mark.parametrize(
+        ("source_currency", "target_currency"),
+        [
+            (Currency.EUR, Currency.USD),
+            (Currency.USD, Currency.EUR),
+            (Currency.KZT, Currency.CNY),
+            (Currency.USD, Currency.KZT),
+            (Currency.CNY, Currency.RUB),
+        ],
+    )
+    @pytest.mark.parametrize("amount", ["0.07", "1", "33.33", "50", "123.45"])
+    def test_foreign_transfer_never_creates_money(
+        self, bank, processor, accounts, source_currency, target_currency, amount
+    ):
+        source, target = accounts(source_currency, target_currency)
+        before = bank.get_total_balance()
+        transaction = Transaction(
+            TransactionType.TRANSFER,
+            Decimal(amount),
+            currency=source_currency,
+            source_account_id=source.account_id,
+            target_account_id=target.account_id,
+        )
+
+        processor.process(transaction)
+
+        paid = Decimal("1000") - source.balance
+        received_value = bank.converter.convert(
+            target.balance, target_currency, source_currency, rounding=ROUND_DOWN
+        )
+        assert paid <= Decimal(amount)
+        assert received_value <= paid
+        assert bank.get_total_balance() <= before
+
+    def test_withdrawal_in_another_currency_rounds_the_debit_up(self, bank, processor):
+        usd = bank.open_account(
+            1, "bank", balance=Decimal("100"), currency=Currency.USD
+        )
+        withdrawal = Transaction(
+            TransactionType.WITHDRAWAL, Decimal("100"), source_account_id=usd.account_id
+        )
+
+        processor.process(withdrawal)
+
+        # 100 RUB = 1.111 USD -> списано 1.12
+        assert usd.balance == Decimal("98.88")
+
+    def test_deposit_in_another_currency_rounds_the_credit_down(self, bank, processor):
+        usd = bank.open_account(1, "bank", balance=Decimal("0"), currency=Currency.USD)
+        deposit = Transaction(
+            TransactionType.DEPOSIT, Decimal("100"), target_account_id=usd.account_id
+        )
+
+        processor.process(deposit)
+
+        # 100 RUB = 1.111 USD -> зачислено 1.11
+        assert usd.balance == Decimal("1.11")

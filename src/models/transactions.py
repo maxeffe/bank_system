@@ -37,20 +37,8 @@ class Transaction:
         created_at: datetime = None,
         time_provider=None,
     ):
-        if not isinstance(transaction_type, TransactionType):
-            raise InvalidOperationError("Invalid transaction type")
-
-        if not isinstance(currency, Currency):
-            raise InvalidOperationError("Invalid currency")
-
-        if not isinstance(priority, TransactionPriority):
-            raise InvalidOperationError("Invalid transaction priority")
-
+        self._validate_kinds(transaction_type, currency, priority, scheduled_at)
         amount = to_positive_money(amount, "Amount must be a positive number")
-
-        if scheduled_at is not None and not isinstance(scheduled_at, datetime):
-            raise InvalidOperationError("Scheduled time must be a datetime")
-
         self._validate_participants(
             transaction_type, source_account_id, target_account_id
         )
@@ -75,6 +63,20 @@ class Transaction:
         self._created_at = created_at or self._time_provider()
         self._updated_at = self._created_at
         self._completed_at = None
+
+    @staticmethod
+    def _validate_kinds(transaction_type, currency, priority, scheduled_at):
+        if not isinstance(transaction_type, TransactionType):
+            raise InvalidOperationError("Invalid transaction type")
+
+        if not isinstance(currency, Currency):
+            raise InvalidOperationError("Invalid currency")
+
+        if not isinstance(priority, TransactionPriority):
+            raise InvalidOperationError("Invalid transaction priority")
+
+        if scheduled_at is not None and not isinstance(scheduled_at, datetime):
+            raise InvalidOperationError("Scheduled time must be a datetime")
 
     @staticmethod
     def _validate_participants(transaction_type, source_account_id, target_account_id):
@@ -211,8 +213,8 @@ class Transaction:
         if not isinstance(reason, str) or not reason.strip():
             raise InvalidOperationError("Failure reason is required")
 
-        if self._status in (TransactionStatus.COMPLETED, TransactionStatus.CANCELLED):
-            raise InvalidOperationError("Finished transaction cannot fail")
+        if self._status is not TransactionStatus.PROCESSING:
+            raise InvalidOperationError("Only a processing transaction can fail")
 
         self._status = TransactionStatus.FAILED
         self._failure_reason = reason.strip()

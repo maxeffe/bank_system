@@ -41,3 +41,15 @@ class TransactionPriority(StrEnum):
     HIGH = "high"
     NORMAL = "normal"
     LOW = "low"
+
+
+class AuditSeverity(StrEnum):
+    INFO = "info"
+    WARNING = "warning"
+    CRITICAL = "critical"
+
+
+class RiskLevel(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"

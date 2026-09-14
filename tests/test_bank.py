@@ -3,9 +3,9 @@ from decimal import Decimal
 
 import pytest
 
-from src.enums import AccountStatus, ClientStatus, Currency
+from src.enums import AccountStatus, ClientStatus, Currency, TransactionType
 from src.exceptions import AccountClosedError, InvalidOperationError
-from src.models import Bank, CurrencyConverter
+from src.models import Bank, CurrencyConverter, Transaction, TransactionProcessor
 from src.models.accounts import (
     BankAccount,
     InvestmentAccount,
@@ -72,7 +72,7 @@ class TestOpenAccount:
         account = bank_with_client.open_account(1, "bank", balance=Decimal("100"))
 
         assert bank_with_client.accounts[account.account_id] is account
-        assert account.account_id in bank_with_client.clients[1].account_ids
+        assert bank_with_client.search_accounts(client_id=1) == [account]
         assert account.owner_name == "Max Petrov"
 
     def test_rejects_duplicate_account_id(self, transfer_bank):
@@ -97,7 +97,8 @@ class TestOpenAccount:
         assert original.balance == Decimal("50000.00")
         assert len(transfer_bank.accounts) == accounts_before
         assert transfer_bank.get_total_balance() == total_before
-        assert "ABC123" not in transfer_bank.clients[2].account_ids
+        client_accounts = transfer_bank.search_accounts(client_id=2)
+        assert "ABC123" not in [account.account_id for account in client_accounts]
 
     def test_rejects_unknown_type(self, bank_with_client):
         with pytest.raises(InvalidOperationError):
@@ -308,8 +309,9 @@ class TestReports:
 
     def test_total_balance_ignores_closed(self, bank_with_client):
         bank_with_client.open_account(1, "bank", balance=Decimal("100"))
-        empty = bank_with_client.open_account(1, "savings")
-        bank_with_client.close_account(empty.account_id)
+        closed = bank_with_client.open_account(1, "savings")
+        bank_with_client.close_account(closed.account_id)
+        closed.refund(Decimal("50"))
 
         assert bank_with_client.get_total_balance() == Decimal("100.00")
 
@@ -399,3 +401,59 @@ class TestRestrictedTime:
         night_bank._clients[1] = make_client()
 
         assert night_bank.authenticate_client(1, "secret-pass") is True
+
+
+class TestClientHistoryAndStatistics:
+    def test_history_of_an_unknown_client_is_an_error(self, bank):
+        with pytest.raises(InvalidOperationError):
+            bank.get_client_history(99)
+
+    def test_new_bank_has_empty_statistics(self, bank):
+        statistics = bank.get_transaction_statistics()
+
+        assert statistics["total"] == 0
+
+    def test_receiver_sees_a_processed_transfer(
+        self, transfer_bank, source_account, target_account
+    ):
+        processor = TransactionProcessor(transfer_bank)
+        processor.process(
+            Transaction(
+                TransactionType.TRANSFER,
+                Decimal("250"),
+                source_account_id=source_account.account_id,
+                target_account_id=target_account.account_id,
+            )
+        )
+
+        sender = transfer_bank.get_client_history(1)
+        receiver = transfer_bank.get_client_history(2)
+
+        assert [row["direction"] for row in sender] == ["out"]
+        assert [row["direction"] for row in receiver] == ["in"]
+        assert transfer_bank.get_transaction_statistics()["completed"] == 1
+
+
+class TestAccountOwnership:
+    def test_client_accounts_follow_the_account_owner(self, transfer_bank):
+        owners = {
+            account.user_id for account in transfer_bank.search_accounts(client_id=2)
+        }
+
+        assert owners == {2}
+
+    def test_ranking_sums_only_accounts_of_the_client(self, transfer_bank):
+        ranking = dict(
+            (client.client_id, total)
+            for client, total in transfer_bank.get_clients_ranking()
+        )
+
+        assert ranking == {1: Decimal("10000.00"), 2: Decimal("1000.00")}
+
+    def test_account_with_money_cannot_be_opened_closed(self, bank_with_client):
+        with pytest.raises(InvalidOperationError):
+            bank_with_client.open_account(
+                1, "bank", balance=Decimal("500"), status=AccountStatus.CLOSED
+            )
+
+        assert bank_with_client.accounts == {}

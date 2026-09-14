@@ -25,7 +25,7 @@ class AuthService:
 
         return False
 
-    def ensure_can_operate(self, client, action):
+    def ensure_can_operate(self, client, action, now=None):
         if client.status is ClientStatus.BLOCKED:
-            self._journal.flag_client(client, action)
+            self._journal.flag_client(client, action, now)
             raise InvalidOperationError("Blocked client cannot operate")

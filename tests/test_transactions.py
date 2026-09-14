@@ -176,6 +176,14 @@ class TestLifecycle:
         with pytest.raises(InvalidOperationError):
             transaction.mark_failed("too late")
 
+    def test_open_transaction_cannot_fail(self):
+        transaction = make_transfer()
+
+        with pytest.raises(InvalidOperationError):
+            transaction.mark_failed("not started")
+
+        assert transaction.status is TransactionStatus.PENDING
+
     @pytest.mark.parametrize("reason", ["", "   ", None, 123])
     def test_failure_reason_is_required(self, reason):
         transaction = make_transfer()

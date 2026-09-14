@@ -24,3 +24,11 @@ class TransientTransactionError(TransactionError):
 
 class CurrencyConversionError(TransactionError):
     pass
+
+
+class RiskBlockedError(TransactionError):
+    pass
+
+
+class AuditWriteError(Exception):
+    pass

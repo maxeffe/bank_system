@@ -6,6 +6,8 @@ from loguru import logger
 
 from src.enums import AccountStatus, Currency
 from src.money import (
+    MAX_MONEY,
+    MONEY_LIMIT_MESSAGE,
     MONEY_PRECISION,
     to_non_negative_money,
     to_non_negative_rate,
@@ -17,6 +19,14 @@ from src.exceptions import (
     InsufficientFundsError,
     InvalidOperationError,
 )
+
+
+# Годовая доходность активов инвестиционного счёта; ключи - допустимые активы.
+PORTFOLIO_GROWTH_RATES = {
+    "stocks": Decimal("0.12"),
+    "bonds": Decimal("0.05"),
+    "etf": Decimal("0.08"),
+}
 
 
 class AbstractAccount(ABC):
@@ -54,6 +64,8 @@ class AbstractAccount(ABC):
 
 
 class BankAccount(AbstractAccount):
+    INSUFFICIENT_FUNDS_MESSAGE = "Not enough money to withdraw"
+
     def __init__(
         self,
         account_id: str = None,
@@ -68,13 +80,14 @@ class BankAccount(AbstractAccount):
 
         balance = to_non_negative_money(balance, "Balance cannot be negative")
 
-        if not isinstance(status, AccountStatus):
-            raise InvalidOperationError("Invalid account status")
-
         if not isinstance(currency, Currency):
             raise InvalidOperationError("Invalid currency")
 
-        super().__init__(account_id, user_id, owner_name, balance, status, currency)
+        super().__init__(
+            account_id, user_id, owner_name, balance, AccountStatus.ACTIVE, currency
+        )
+        # Через сеттер: правила статуса одни и те же при создании и потом.
+        self.status = status
 
     @property
     def account_id(self):
@@ -117,10 +130,18 @@ class BankAccount(AbstractAccount):
         ):
             raise InvalidOperationError("Closed account cannot change status")
 
+        if new_status is AccountStatus.CLOSED and self._balance != 0:
+            raise InvalidOperationError(
+                "Account with non-zero balance cannot be closed"
+            )
+
         self._status = new_status
 
     def _validate_amount(self, amount):
         return to_positive_money(amount, "Amount must be a positive number")
+
+    def _check_withdraw_limit(self, amount):
+        """Лимит одного снятия. У обычного счёта его нет."""
 
     def withdrawal_fee(self, amount) -> Decimal:
         """Своя комиссия счёта за снятие. Базовый счёт не берёт ничего."""
@@ -162,30 +183,26 @@ class BankAccount(AbstractAccount):
     def deposit(self, amount):
         self.ensure_operational("accept deposits")
         amount = self._validate_amount(amount)
-        self._balance += amount
-        logger.info(
-            "deposit",
-            account_id=self._account_id,
-            amount=amount,
-            currency=self._currency,
-            balance=self._balance,
-        )
+        self._change_balance(amount)
+        self._log_balance_change("deposit", amount)
 
     def withdraw(self, amount):
+        """Одно правило снятия для всех типов счёта.
+
+        Тип счёта меняет только хуки: лимит снятия, комиссию и нижнюю границу
+        баланса. Возвращает, сколько реально ушло со счёта вместе с комиссией.
+        """
         self.ensure_operational("withdraw money")
         amount = self._validate_amount(amount)
+        self._check_withdraw_limit(amount)
+        fee = self.withdrawal_fee(amount)
 
-        if self._balance - amount < self.min_allowed_balance:
-            raise InsufficientFundsError("Not enough money to withdraw")
+        if self._balance - amount - fee < self.min_allowed_balance:
+            raise InsufficientFundsError(self.INSUFFICIENT_FUNDS_MESSAGE)
 
-        self._balance -= amount
-        logger.info(
-            "withdrawal",
-            account_id=self._account_id,
-            amount=amount,
-            currency=self._currency,
-            balance=self._balance,
-        )
+        self._change_balance(-(amount + fee))
+        self._log_balance_change("withdrawal", amount, fee=fee)
+        return amount + fee
 
     def refund(self, amount):
         """Возврат ранее списанного.
@@ -195,13 +212,26 @@ class BankAccount(AbstractAccount):
         деньги обязаны вернуться даже на замороженный счёт.
         """
         amount = self._validate_amount(amount)
-        self._balance += amount
+        self._change_balance(amount)
+        self._log_balance_change("refund", amount)
+
+    def _change_balance(self, delta):
+        """Единственное место, где меняется баланс: он не выходит за MAX_MONEY."""
+        new_balance = self._balance + delta
+
+        if abs(new_balance) > MAX_MONEY:
+            raise InvalidOperationError(MONEY_LIMIT_MESSAGE)
+
+        self._balance = new_balance
+
+    def _log_balance_change(self, event, amount, **extra):
         logger.info(
-            "refund",
+            event,
             account_id=self._account_id,
             amount=amount,
             currency=self._currency,
             balance=self._balance,
+            **extra,
         )
 
     def get_account_info(self):
@@ -209,6 +239,8 @@ class BankAccount(AbstractAccount):
 
 
 class SavingsAccount(BankAccount):
+    INSUFFICIENT_FUNDS_MESSAGE = "Withdrawal would break minimum balance"
+
     def __init__(
         self,
         account_id: str = None,
@@ -236,13 +268,8 @@ class SavingsAccount(BankAccount):
         self._monthly_interest_rate = monthly_interest_rate
 
     def withdraw(self, amount):
-        self.ensure_operational("withdraw money")
-        amount = self._validate_amount(amount)
-
-        if self._balance - amount < self.min_allowed_balance:
-            raise InsufficientFundsError("Withdrawal would break minimum balance")
-
-        super().withdraw(amount)
+        """Общее правило; нижняя граница - неснижаемый остаток."""
+        return super().withdraw(amount)
 
     @property
     def min_allowed_balance(self) -> Decimal:
@@ -253,7 +280,8 @@ class SavingsAccount(BankAccount):
         interest = (self._balance * self._monthly_interest_rate).quantize(
             MONEY_PRECISION, rounding=ROUND_HALF_UP
         )
-        self._balance += interest
+        self._change_balance(interest)
+        self._log_balance_change("interest_applied", interest)
         return interest
 
     def get_account_info(self):
@@ -268,6 +296,8 @@ class SavingsAccount(BankAccount):
 
 
 class PremiumAccount(BankAccount):
+    INSUFFICIENT_FUNDS_MESSAGE = "Overdraft limit exceeded"
+
     def __init__(
         self,
         account_id: str = None,
@@ -295,26 +325,12 @@ class PremiumAccount(BankAccount):
         self._fixed_fee = fixed_fee
 
     def withdraw(self, amount):
-        self.ensure_operational("withdraw money")
-        amount = self._validate_amount(amount)
+        """Общее правило; лимит снятия, фиксированная комиссия и овердрафт."""
+        return super().withdraw(amount)
 
+    def _check_withdraw_limit(self, amount):
         if amount > self._withdraw_limit:
             raise InvalidOperationError("Withdraw limit exceeded")
-
-        total_amount = amount + self.withdrawal_fee(amount)
-
-        if self._balance - total_amount < self.min_allowed_balance:
-            raise InsufficientFundsError("Overdraft limit exceeded")
-
-        self._balance -= total_amount
-        logger.info(
-            "withdrawal",
-            account_id=self._account_id,
-            amount=amount,
-            fee=self._fixed_fee,
-            currency=self._currency,
-            balance=self._balance,
-        )
 
     def withdrawal_fee(self, amount) -> Decimal:
         return self._fixed_fee
@@ -354,38 +370,32 @@ class InvestmentAccount(BankAccount):
         if not isinstance(portfolio, dict):
             raise InvalidOperationError("Portfolio must be a dictionary")
 
-        allowed_assets = ("stocks", "bonds", "etf")
         validated_portfolio = {}
 
         for asset, value in portfolio.items():
-            if asset not in allowed_assets:
+            if asset not in PORTFOLIO_GROWTH_RATES:
                 raise InvalidOperationError("Unknown portfolio asset")
 
             validated_portfolio[asset] = to_non_negative_money(
                 value, "Portfolio asset value cannot be negative"
             )
 
-        for asset in allowed_assets:
+        for asset in PORTFOLIO_GROWTH_RATES:
             validated_portfolio.setdefault(asset, Decimal("0.00"))
 
         return validated_portfolio
 
     def project_yearly_growth(self):
-        growth_rates = {
-            "stocks": Decimal("0.12"),
-            "bonds": Decimal("0.05"),
-            "etf": Decimal("0.08"),
-        }
-
         projected_growth = Decimal("0")
 
         for asset, value in self._portfolio.items():
-            projected_growth += value * growth_rates[asset]
+            projected_growth += value * PORTFOLIO_GROWTH_RATES[asset]
 
         return projected_growth.quantize(MONEY_PRECISION, rounding=ROUND_HALF_UP)
 
     def withdraw(self, amount):
-        super().withdraw(amount)
+        """Общее правило без особенностей: портфель на снятие не влияет."""
+        return super().withdraw(amount)
 
     def get_account_info(self):
         return str(self)

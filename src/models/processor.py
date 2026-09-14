@@ -1,17 +1,16 @@
 from contextlib import contextmanager
 from datetime import datetime
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal
 
 from loguru import logger
 
 from src.enums import Currency, TransactionType
 from src.exceptions import (
-    InsufficientFundsError,
+    AuditWriteError,
     InvalidOperationError,
     TransientTransactionError,
 )
 from src.money import MONEY_PRECISION
-from src.models.exchange import CurrencyConverter
 from src.models.queue import TransactionQueue
 
 EXTERNAL_TRANSFER_FEE_RATE = Decimal("0.01")
@@ -20,12 +19,15 @@ DEFAULT_MAX_ATTEMPTS = 3
 
 
 class TransactionProcessor:
-    """Исполняет транзакции: комиссии, конвертация, повторы, журнал ошибок."""
+    """Исполняет транзакции: комиссии, конвертация, повторы, журнал ошибок.
+
+    Курсы берутся у банка. При пересчёте валют зачисление округляется вниз,
+    списание вверх: доля копейки остаётся у банка, а не возникает из воздуха.
+    """
 
     def __init__(
         self,
         bank,
-        exchange_rates: dict = None,
         external_gateway=None,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         time_provider=None,
@@ -34,14 +36,10 @@ class TransactionProcessor:
             raise InvalidOperationError("Max attempts must be a positive integer")
 
         self._bank = bank
-        self._converter = (
-            CurrencyConverter(exchange_rates)
-            if exchange_rates is not None
-            else bank.converter
-        )
+        self._converter = bank.converter
         self._external_gateway = external_gateway or (lambda transaction: None)
         self._max_attempts = max_attempts
-        self._time_provider = time_provider or datetime.now
+        self._time_provider = time_provider or bank.time_provider
         self._errors = []
         self._handlers = {
             TransactionType.DEPOSIT: self._execute_deposit,
@@ -59,40 +57,56 @@ class TransactionProcessor:
             return Decimal("0.00")
 
         percent_fee = transaction.amount * EXTERNAL_TRANSFER_FEE_RATE
-        minimum_fee = self.convert(
+        minimum_fee = self._converter.convert(
             MIN_EXTERNAL_TRANSFER_FEE, Currency.RUB, transaction.currency
         )
         return max(percent_fee, minimum_fee).quantize(
             MONEY_PRECISION, rounding=ROUND_HALF_UP
         )
 
-    def convert(self, amount, from_currency, to_currency):
-        return self._converter.convert(amount, from_currency, to_currency)
-
     def process(self, transaction, now: datetime = None):
         moment = now or self._time_provider()
         transaction.mark_processing(now=moment)
         last_error = None
 
+        try:
+            # Риск считается один раз на транзакцию, а не на каждую попытку:
+            # иначе повторы сами раздували бы частоту операций клиента.
+            self._bank.assess_transaction(transaction, now=moment)
+        except Exception as error:
+            self._record_error(transaction, error, moment)
+            self._fail(transaction, error, moment)
+            return False
+
         for _ in range(self._max_attempts):
-            transaction.register_attempt(now=self._time_provider())
+            transaction.register_attempt(now=moment)
 
             try:
-                self._execute(transaction)
+                self._execute(transaction, moment)
             except TransientTransactionError as error:
                 last_error = error
-                self._record_error(transaction, error)
+                self._record_error(transaction, error, moment)
                 continue
             except Exception as error:
                 # Никакая ошибка не должна утащить транзакцию из очереди
                 # в вечный PROCESSING. Ловим всё, пишем в журнал, помечаем failed.
-                self._fail(transaction, error)
+                self._record_error(transaction, error, moment)
+                self._fail(transaction, error, moment)
                 return False
             else:
-                transaction.mark_completed(now=self._time_provider())
+                transaction.mark_completed(now=moment)
+                logger.info(
+                    "transaction_completed",
+                    transaction_id=transaction.transaction_id,
+                    transaction_type=transaction.transaction_type,
+                    amount=transaction.amount,
+                    fee=transaction.fee,
+                    currency=transaction.currency,
+                )
+                self._record_outcome(transaction)
                 return True
 
-        self._fail(transaction, last_error, already_logged=True)
+        self._fail(transaction, last_error, moment)
         return False
 
     def process_queue(self, queue, now: datetime = None):
@@ -117,45 +131,45 @@ class TransactionProcessor:
 
         return summary
 
-    def _execute(self, transaction):
-        self._bank.journal.ensure_allowed_time("process_transaction")
+    def _execute(self, transaction, moment):
+        self._bank.ensure_can_process(transaction, now=moment)
         transaction.apply_fee(self.calculate_fee(transaction))
         self._handlers[transaction.transaction_type](transaction)
 
     def _execute_deposit(self, transaction):
-        target = self._get_account(transaction.target_account_id)
-        target.deposit(self._to_account_money(transaction.amount, transaction, target))
+        target = self._bank.get_account(transaction.target_account_id)
+        target.deposit(self._credited(transaction.amount, transaction, target))
 
     def _execute_withdrawal(self, transaction):
-        source = self._get_source(transaction.source_account_id)
-        total = self._to_account_money(transaction.total_amount, transaction, source)
-
-        self._ensure_can_send(source, total)
-        source.withdraw(total)
+        source = self._bank.get_account(transaction.source_account_id)
+        source.withdraw(self._debited(transaction.total_amount, transaction, source))
 
     def _execute_transfer(self, transaction):
-        source = self._get_source(transaction.source_account_id)
-        target = self._get_account(transaction.target_account_id)
+        source = self._bank.get_account(transaction.source_account_id)
+        target = self._bank.get_account(transaction.target_account_id)
 
         source.ensure_operational("send money")
         target.ensure_operational("receive money")
 
-        credited = self._to_account_money(transaction.amount, transaction, target)
+        credited = self._credited(transaction.amount, transaction, target)
 
         if credited <= 0:
             raise InvalidOperationError("Amount is too small for the target currency")
 
-        # Получатель может принять только целые копейки своей валюты. Списываем
-        # ровно столько, сколько эти копейки стоят, иначе деньги возникают из воздуха.
-        sent = self._converter.convert(credited, target.currency, source.currency)
-        fee = self._to_account_money(transaction.fee, transaction, source)
+        # Получатель принимает целые копейки своей валюты (округление вниз),
+        # отправитель платит их стоимость (вверх): не больше запрошенной суммы
+        # и не меньше того, что получил получатель.
+        sent = self._converter.convert(
+            credited, target.currency, source.currency, rounding=ROUND_UP
+        )
+        fee = self._debited(transaction.fee, transaction, source)
 
         with self._debit(source, sent + fee):
             target.deposit(credited)
 
     def _execute_external_transfer(self, transaction):
-        source = self._get_source(transaction.source_account_id)
-        total = self._to_account_money(transaction.total_amount, transaction, source)
+        source = self._bank.get_account(transaction.source_account_id)
+        total = self._debited(transaction.total_amount, transaction, source)
 
         with self._debit(source, total):
             self._external_gateway(transaction)
@@ -167,9 +181,7 @@ class TransactionProcessor:
         Возвращается ровно то, что реально ушло со счёта: у премиум-счёта
         сверх суммы списывается ещё и его собственная комиссия.
         """
-        self._ensure_can_send(source, total)
-        debited = total + source.withdrawal_fee(total)
-        source.withdraw(total)
+        debited = source.withdraw(total)
 
         try:
             yield
@@ -186,40 +198,55 @@ class TransactionProcessor:
 
             raise
 
-    def _to_account_money(self, amount, transaction, account):
-        return self.convert(amount, transaction.currency, account.currency)
+    def _credited(self, amount, transaction, account):
+        return self._converter.convert(
+            amount, transaction.currency, account.currency, rounding=ROUND_DOWN
+        )
+
+    def _debited(self, amount, transaction, account):
+        return self._converter.convert(
+            amount, transaction.currency, account.currency, rounding=ROUND_UP
+        )
+
+    def _fail(self, transaction, error, moment):
+        transaction.mark_failed(self._reason(error), now=moment)
+        logger.warning(
+            "transaction_rejected",
+            transaction_id=transaction.transaction_id,
+            transaction_type=transaction.transaction_type,
+            amount=transaction.amount,
+            currency=transaction.currency,
+            error=type(error).__name__,
+            reason=transaction.failure_reason,
+        )
+
+        self._record_outcome(transaction, error)
+
+    def _record_outcome(self, transaction, error=None):
+        """Итог уже наступил: сбой журнала не должен ронять очередь."""
+        try:
+            self._bank.record_outcome(transaction, error)
+        except (AuditWriteError, InvalidOperationError) as audit_error:
+            logger.error(
+                "audit_outcome_lost",
+                transaction_id=transaction.transaction_id,
+                status=str(transaction.status),
+                reason=str(audit_error),
+            )
 
     @staticmethod
-    def _ensure_can_send(account, total):
-        debited = total + account.withdrawal_fee(total)
+    def _reason(error):
+        """Причина отказа не бывает пустой: у ConnectionError() нет текста."""
+        return str(error).strip() or type(error).__name__
 
-        if account.balance - debited < account.min_allowed_balance:
-            raise InsufficientFundsError("Transfer would break the balance limit")
-
-    def _get_account(self, account_id):
-        return self._bank.get_account(account_id)
-
-    def _get_source(self, account_id):
-        """Счёт, с которого уходят деньги: владелец должен быть не заблокирован."""
-        account = self._get_account(account_id)
-        self._bank.ensure_client_can_operate(account.user_id, "send money")
-        return account
-
-    def _fail(self, transaction, error, already_logged=False):
-        reason = str(error) if error else "Unknown processing error"
-        transaction.mark_failed(reason, now=self._time_provider())
-
-        if not already_logged:
-            self._record_error(transaction, error)
-
-    def _record_error(self, transaction, error):
+    def _record_error(self, transaction, error, moment):
         self._errors.append(
             {
                 "transaction_id": transaction.transaction_id,
                 "transaction_type": str(transaction.transaction_type),
                 "attempt": transaction.attempts,
-                "error": type(error).__name__ if error else "UnknownError",
-                "message": str(error) if error else "Unknown processing error",
-                "time": self._time_provider().isoformat(timespec="seconds"),
+                "error": type(error).__name__,
+                "message": self._reason(error),
+                "time": moment.isoformat(timespec="seconds"),
             }
         )

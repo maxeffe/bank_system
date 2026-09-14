@@ -3,7 +3,14 @@ from decimal import Decimal
 import pytest
 
 from src.exceptions import InvalidOperationError
-from src.money import MONEY_PRECISION, is_valid_money, to_money, to_rate
+from src.money import (
+    MAX_MONEY,
+    MONEY_LIMIT_MESSAGE,
+    MONEY_PRECISION,
+    is_valid_money,
+    to_money,
+    to_rate,
+)
 
 
 class TestIsValidMoney:
@@ -41,6 +48,14 @@ class TestToMoney:
     @pytest.mark.parametrize("value", [0.1, True, "100", None, Decimal("NaN")])
     def test_rejects_invalid_value(self, value):
         with pytest.raises(InvalidOperationError, match="bad"):
+            to_money(value, "bad")
+
+    def test_limit_itself_is_allowed(self):
+        assert to_money(MAX_MONEY, "bad") == MAX_MONEY
+
+    @pytest.mark.parametrize("value", [MAX_MONEY + 1, -MAX_MONEY - 1])
+    def test_rejects_amount_above_the_limit(self, value):
+        with pytest.raises(InvalidOperationError, match=MONEY_LIMIT_MESSAGE):
             to_money(value, "bad")
 
 

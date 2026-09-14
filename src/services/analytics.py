@@ -19,15 +19,15 @@ class BankAnalytics:
             Decimal("0.00"),
         )
 
-    def clients_ranking(self, clients, accounts_by_id, currency=Currency.RUB):
+    def clients_ranking(self, clients, accounts, currency=Currency.RUB):
+        accounts = list(accounts)
         ranking = [
-            (client, self._client_total(client, accounts_by_id, currency))
+            (
+                client,
+                self.total_balance(
+                    [a for a in accounts if a.user_id == client.client_id], currency
+                ),
+            )
             for client in clients
         ]
         return sorted(ranking, key=lambda item: item[1], reverse=True)
-
-    def _client_total(self, client, accounts_by_id, currency):
-        accounts = (accounts_by_id.get(account_id) for account_id in client.account_ids)
-        return self.total_balance(
-            [account for account in accounts if account is not None], currency
-        )

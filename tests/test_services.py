@@ -7,7 +7,7 @@ from src.enums import AccountStatus, ClientStatus, Currency
 from src.exceptions import InvalidOperationError
 from src.models import CurrencyConverter
 from src.models.accounts import BankAccount
-from src.services import AuthService, BankAnalytics, FraudJournal
+from src.services import AuditLog, AuthService, BankAnalytics, FraudJournal
 
 NIGHT = datetime(2026, 9, 4, 2, 0)
 DAY = datetime(2026, 9, 4, 14, 0)
@@ -173,14 +173,6 @@ class TestBankAnalytics:
             "10.00"
         )
 
-    def test_ignores_closed_accounts(self, analytics):
-        accounts = [
-            make_account("100"),
-            make_account("500", status=AccountStatus.CLOSED),
-        ]
-
-        assert analytics.total_balance(accounts) == Decimal("100.00")
-
     def test_empty_list(self, analytics):
         assert analytics.total_balance([]) == Decimal("0.00")
 
@@ -188,20 +180,36 @@ class TestBankAnalytics:
         poor = make_client(client_id=1, full_name="Anna Ivanova")
         rich = make_client(client_id=2, full_name="Max Petrov")
         small = make_account("150")
-        big = make_account("2", Currency.USD)
-        poor.add_account_id(small.account_id)
-        rich.add_account_id(big.account_id)
-        accounts = {small.account_id: small, big.account_id: big}
+        big = BankAccount(
+            user_id=2,
+            owner_name="Max Petrov",
+            balance=Decimal("2"),
+            currency=Currency.USD,
+        )
 
-        ranking = analytics.clients_ranking([poor, rich], accounts)
+        ranking = analytics.clients_ranking([poor, rich], [small, big])
 
         assert [client.client_id for client, _ in ranking] == [2, 1]
         assert [total for _, total in ranking] == [Decimal("180.00"), Decimal("150.00")]
 
-    def test_ranking_skips_unknown_account_ids(self, analytics, make_client):
-        client = make_client()
-        client.add_account_id("does-not-exist")
 
-        ranking = analytics.clients_ranking([client], {})
+class TestFraudJournalClock:
+    def test_record_time_comes_from_the_journal_clock(self):
+        audit = AuditLog(time_provider=at(datetime(2026, 10, 3, 12, 0)))
+        journal = FraudJournal(time_provider=at(DAY), audit_log=audit)
 
-        assert ranking == [(client, Decimal("0.00"))]
+        journal.record(1, "failed_login")
+
+        assert journal.actions[0]["time"] == "2026-09-04T14:00:00"
+        assert audit.records[0]["time"] == DAY
+
+
+class TestAnalyticsClosedAccounts:
+    def test_ignores_closed_accounts(self):
+        analytics = BankAnalytics(CurrencyConverter())
+        closed = make_account("0", status=AccountStatus.CLOSED)
+        # Возврат доходит и до закрытого счёта: так у него появляются деньги.
+        closed.refund(Decimal("50"))
+        accounts = [make_account("100"), closed]
+
+        assert analytics.total_balance(accounts) == Decimal("100.00")
