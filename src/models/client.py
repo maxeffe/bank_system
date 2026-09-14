@@ -55,6 +55,7 @@ class Client:
         self._password_hash = self._hash_password(password, self._password_salt)
         self._status = status
         self._failed_login_attempts = 0
+        self._account_ids = []
 
     @property
     def client_id(self):
@@ -71,6 +72,10 @@ class Client:
     @property
     def contacts(self):
         return self._contacts.copy()
+
+    @property
+    def account_ids(self):
+        return self._account_ids.copy()
 
     @property
     def failed_login_attempts(self):
@@ -135,6 +140,11 @@ class Client:
 
     def reset_failed_logins(self):
         self._failed_login_attempts = 0
+
+    def add_account_id(self, account_id):
+        """Номер счёта клиента. Добавляет банк, когда счёт открыт."""
+        if account_id not in self._account_ids:
+            self._account_ids.append(account_id)
 
     def mark_suspicious(self):
         if self._status is ClientStatus.ACTIVE:

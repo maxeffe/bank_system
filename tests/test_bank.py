@@ -73,6 +73,7 @@ class TestOpenAccount:
 
         assert bank_with_client.accounts[account.account_id] is account
         assert bank_with_client.search_accounts(client_id=1) == [account]
+        assert bank_with_client.clients[1].account_ids == [account.account_id]
         assert account.owner_name == "Max Petrov"
 
     def test_rejects_duplicate_account_id(self, transfer_bank):
@@ -99,6 +100,7 @@ class TestOpenAccount:
         assert transfer_bank.get_total_balance() == total_before
         client_accounts = transfer_bank.search_accounts(client_id=2)
         assert "ABC123" not in [account.account_id for account in client_accounts]
+        assert "ABC123" not in transfer_bank.clients[2].account_ids
 
     def test_rejects_unknown_type(self, bank_with_client):
         with pytest.raises(InvalidOperationError):
@@ -435,6 +437,13 @@ class TestClientHistoryAndStatistics:
 
 
 class TestAccountOwnership:
+    def test_client_account_ids_match_the_account_owners(self, transfer_bank):
+        transfer_bank.open_account(2, "savings")
+
+        for client_id, client in transfer_bank.clients.items():
+            owned = transfer_bank.search_accounts(client_id=client_id)
+            assert client.account_ids == [account.account_id for account in owned]
+
     def test_client_accounts_follow_the_account_owner(self, transfer_bank):
         owners = {
             account.user_id for account in transfer_bank.search_accounts(client_id=2)

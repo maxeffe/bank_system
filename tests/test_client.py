@@ -12,6 +12,7 @@ class TestClientCreation:
         assert client.client_id == 1
         assert client.full_name == "Max Petrov"
         assert client.age == 30
+        assert client.account_ids == []
         assert client.status is ClientStatus.ACTIVE
         assert client.failed_login_attempts == 0
 
@@ -177,6 +178,31 @@ class TestLoginAttempts:
         client.reset_failed_logins()
 
         assert client.failed_login_attempts == 0
+
+
+class TestAccountIds:
+    def test_adds_account_id(self, make_client):
+        client = make_client()
+
+        client.add_account_id("abc123")
+
+        assert client.account_ids == ["abc123"]
+
+    def test_same_id_is_added_once(self, make_client):
+        client = make_client()
+
+        client.add_account_id("abc123")
+        client.add_account_id("abc123")
+
+        assert client.account_ids == ["abc123"]
+
+    def test_list_is_a_copy(self, make_client):
+        client = make_client()
+        client.add_account_id("abc123")
+
+        client.account_ids.append("hacked")
+
+        assert client.account_ids == ["abc123"]
 
 
 class TestStatusChanges:

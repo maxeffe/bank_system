@@ -140,6 +140,7 @@ class Bank:
             balance=account.balance,
         )
         self._accounts[account.account_id] = account
+        client.add_account_id(account.account_id)
         return account
 
     def close_account(self, account_id):

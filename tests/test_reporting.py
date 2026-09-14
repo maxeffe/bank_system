@@ -126,6 +126,7 @@ class TestBalanceHistory:
 
         assert bank.accounts == {}
         assert bank.search_accounts(client_id=client.client_id) == []
+        assert client.account_ids == []
 
 
 class TestClientReport:

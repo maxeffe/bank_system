@@ -179,14 +179,15 @@ def show_initialization(demo):
     print(f"\nКлиенты ({len(demo.bank.clients)}):")
 
     for client in demo.bank.clients.values():
-        print(f"  #{client.client_id:<2} {client.full_name:<18} {client.age} лет")
+        print(f"  #{client.client_id:<2} {client.full_name:<18} возраст {client.age}")
 
     print(f"\nСчета ({len(demo.accounts)}):")
 
     for label, account in demo.accounts.items():
         owner = demo.bank.clients[account.user_id].full_name
         print(
-            f"  {label:<13} {type(account).__name__:<18} {owner:<18} "
+            f"  {label:<13} {account.account_id:<9} "
+            f"{type(account).__name__:<18} {owner:<18} "
             f"{account.balance:>12} {account.currency}"
         )
 
